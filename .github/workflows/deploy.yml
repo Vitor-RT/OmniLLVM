@@ -62,7 +62,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
-            git cmake ninja-build clang lld mold ccache patchelf curl ca-certificates \
+            git cmake ninja-build make clang lld mold ccache patchelf curl ca-certificates \
             python3 pkg-config libncurses-dev libedit-dev \
             libxml2-dev uuid-dev libicu-dev libsqlite3-dev \
             libcurl4-openssl-dev libblocksruntime-dev zlib1g-dev zstd xz-utils file procps
@@ -292,7 +292,7 @@ jobs:
       - name: 3A. Compilar Flang + MLIR Dinâmicos (-O3)
         if: matrix.component == 'flang-mlir'
         run: |
-          apt-get install -y -qq --no-install-recommends cmake ninja-build clang lld mold ccache python3 zlib1g-dev
+          apt-get install -y -qq --no-install-recommends cmake ninja-build make clang lld mold ccache python3 zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
@@ -302,7 +302,8 @@ jobs:
           git clone --filter=blob:none --no-checkout --depth 1 --branch swift/${{ env.SWIFT_SCHEME }} https://github.com/swiftlang/llvm-project.git
           cd llvm-project
           git sparse-checkout init --cone
-          git sparse-checkout set cmake llvm mlir flang clang
+          # CORREÇÃO: Inclui 'runtimes' e 'flang-rt' exigidos pelo CMake do LLVM 21 ao habilitar o Flang
+          git sparse-checkout set cmake llvm mlir flang clang runtimes flang-rt
           git checkout
 
           cmake -G Ninja -S llvm -B build \
@@ -321,6 +322,7 @@ jobs:
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_TARGETS_TO_BUILD="X86;AArch64;RISCV" \
             -DLLVM_ENABLE_PROJECTS="clang;mlir;flang" \
+            -DLLVM_ENABLE_RUNTIMES="" \
             -DLLVM_USE_LINKER=mold \
             -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
             -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
@@ -346,14 +348,14 @@ jobs:
       - name: 3B. Compilar GNAT-LLVM Dinâmico (Shared libLLVM.so)
         if: matrix.component == 'gnat-ada'
         run: |
-          apt-get install -y -qq --no-install-recommends gnat gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
+          # CORREÇÃO: Adicionado 'make' e 'build-essential' (estava falhando com "make: not found")
+          apt-get install -y -qq --no-install-recommends make build-essential gnat gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
           export TMPDIR="/tmp"
 
           mkdir -p $GITHUB_WORKSPACE/ada && cd $GITHUB_WORKSPACE/ada
-          # Clona usando a branch default (main/master) sem fixar 'master' que não existe mais no llvm-bindings
           git clone --depth 1 https://github.com/AdaCore/gnat-llvm.git
           cd gnat-llvm
           git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
@@ -380,7 +382,7 @@ jobs:
       - name: 3C. Compilar Rustc Dinâmico (link-shared = true + mold)
         if: matrix.component == 'rust'
         run: |
-          apt-get install -y -qq --no-install-recommends cmake ninja-build clang mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
+          apt-get install -y -qq --no-install-recommends make build-essential cmake ninja-build clang mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
@@ -391,6 +393,8 @@ jobs:
           git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
           cd rust
 
+          # CORREÇÃO: target = ["${{ matrix.rust_triple }}"] evita que o bootstrap exija cross-gcc
+          # (x86_64-linux-gnu-gcc e riscv64-linux-gnu-gcc) no container durante a compilação da stdlib nativa.
           cat <<EOF > bootstrap.toml
           change-id = "ignore"
           profile = "compiler"
@@ -402,7 +406,7 @@ jobs:
           [build]
           build = "${{ matrix.rust_triple }}"
           host = ["${{ matrix.rust_triple }}"]
-          target = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "riscv64gc-unknown-linux-gnu"]
+          target = ["${{ matrix.rust_triple }}"]
           jobs = ${{ steps.hw.outputs.compile_jobs }}
           docs = false
           extended = true
