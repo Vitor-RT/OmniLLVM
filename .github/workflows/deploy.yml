@@ -54,15 +54,15 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
             git cmake ninja-build clang lld mold ccache patchelf curl ca-certificates \
-            python3 pkg-config libncurses-dev libedit-dev swig \
+            python3 pkg-config libncurses-dev libedit-dev \
             libxml2-dev uuid-dev libicu-dev libsqlite3-dev \
             libcurl4-openssl-dev libblocksruntime-dev zlib1g-dev zstd xz-utils file procps
 
-          # Garante fisicamente que nenhum header dev do Python exista no container Ubuntu 26.04
-          apt-get remove -y libpython3*-dev || true
+          # Garante fisicamente que nenhum header dev do Python ou SWIG exista no container Ubuntu 26.04
+          apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }}
 
-          # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap (removendo o clang antigo dele para não conflitar com o Clang 21 do Ubuntu 26.04)
+          # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap (mantendo o Clang 21 do Ubuntu 26.04)
           SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2404${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu24.04${{ matrix.swift_dir_arch }}.tar.gz"
           mkdir -p /opt/swift-bootstrap
           curl -fsSL "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
@@ -105,6 +105,9 @@ jobs:
           export CC=/usr/bin/clang
           export CXX=/usr/bin/clang++
 
+          # Nota: 'lldb' NÃO deve ir em -DLLVM_ENABLE_PROJECTS porque o build-script do Swift
+          # compila o LLDB separadamente via flag --lldb DEPOIS que o Swift e seus módulos CMake
+          # (SwiftAddCustomCommandTarget) já estão prontos.
           ./swift/utils/build-script \
             --release \
             --assertions \
@@ -123,7 +126,7 @@ jobs:
               -DCMAKE_INSTALL_RPATH='\$ORIGIN/../lib:\$ORIGIN' \
               -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
-              -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;lldb' \
+              -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld' \
               -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind' \
               -DLLVM_USE_LINKER=lld \
               -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.cores }} \
@@ -134,9 +137,11 @@ jobs:
               -DLLVM_ENABLE_LIBXML2=OFF \
               -DLLVM_ENABLE_ZSTD=OFF \
               -DLLVM_ENABLE_ZLIB=ON \
+              -DLLDB_ENABLE_SWIG=OFF \
               -DLLDB_ENABLE_PYTHON=OFF \
               -DLLDB_ENABLE_LUA=OFF \
               -DLLDB_ENABLE_LZMA=OFF \
+              -DLLDB_ENABLE_LIBXML2=OFF \
               -DLLVM_INCLUDE_TESTS=OFF \
               -DLLVM_INCLUDE_EXAMPLES=OFF \
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
