@@ -1,0 +1,467 @@
+name: Build OmniLLVM Toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag da Release (ex: v1.0.0-ubuntu26.04)'
+        required: true
+        default: 'v1.0.0-ubuntu26.04'
+  push:
+    tags:
+      - 'v*-llvm*'
+      - 'v*-ubuntu*'
+
+permissions:
+  contents: write
+
+env:
+  INSTALL_PREFIX: /opt/omnillvm
+  SWIFT_SCHEME: release/6.3
+  RUST_BRANCH: 1.91.0
+  DEBIAN_FRONTEND: noninteractive
+  HOST_FAST_FLAGS: "-O2 -pipe -fno-plt -g0 -DNDEBUG -Wl,-rpath,\\$ORIGIN/../lib:\\$ORIGIN"
+
+jobs:
+  # ============================================================================
+  # ESTÁGIO 1: Core Dinâmico em Container Ubuntu 26.04 (LLVM + Clang + LLDB + Swift)
+  # ============================================================================
+  build-core:
+    name: "Stage 1: Core LLVM+Swift [Ubuntu 26.04 - ${{ matrix.arch }}]"
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:26.04
+      options: --privileged -v /opt:/opt
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+
+    steps:
+      - name: 1. Instalar Dependências no Ubuntu 26.04 e Tuning de RAM
+        id: hw
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            git cmake ninja-build clang lld mold ccache patchelf curl ca-certificates \
+            python3 pkg-config libncurses-dev libedit-dev swig \
+            libxml2-dev uuid-dev libicu-dev libsqlite3-dev \
+            libcurl4-openssl-dev libblocksruntime-dev zlib1g-dev zstd xz-utils file procps
+
+          # Garante fisicamente que nenhum header dev do Python exista no container Ubuntu 26.04
+          apt-get remove -y libpython3*-dev || true
+          mkdir -p ${{ env.INSTALL_PREFIX }}
+
+          CORES=$(nproc --all)
+          RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
+          LINK_JOBS=$(( (RAM_GB + 4) / 4 ))
+          if [ "$LINK_JOBS" -lt 2 ]; then LINK_JOBS=2; fi
+          if [ "$LINK_JOBS" -gt "$CORES" ]; then LINK_JOBS=$CORES; fi
+
+          echo "cores=$CORES" >> $GITHUB_OUTPUT
+          echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 2. Cache ccache (Ubuntu 26.04 - ${{ matrix.arch }})
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: omnillvm-u2604-core-${{ matrix.arch }}
+          max-size: 4G
+          compression-level: 6
+
+      - name: 3. Clonar Swift + LLVM 21
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
+          git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
+          ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.cores }}
+
+      - name: 4. Compilar Core 100% Dinâmico (libLLVM.so + libclang-cpp.so + liblldb.so)
+        run: |
+          cd $GITHUB_WORKSPACE/src
+
+          ./swift/utils/build-script \
+            --release \
+            --assertions \
+            --no-swift-stdlib-assertions \
+            --lldb \
+            --lld \
+            --jobs ${{ steps.hw.outputs.cores }} \
+            --install-all \
+            --install-destdir="${{ env.INSTALL_PREFIX }}" \
+            --install-prefix="" \
+            --extra-cmake-options="\
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_INSTALL_RPATH='\$ORIGIN/../lib:\$ORIGIN' \
+              -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+              -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
+              -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;lldb' \
+              -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind' \
+              -DLLVM_USE_LINKER=lld \
+              -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.cores }} \
+              -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
+              -DLLVM_BUILD_LLVM_DYLIB=ON \
+              -DLLVM_LINK_LLVM_DYLIB=ON \
+              -DCLANG_LINK_CLANG_DYLIB=ON \
+              -DLLVM_ENABLE_LIBXML2=OFF \
+              -DLLVM_ENABLE_ZSTD=OFF \
+              -DLLVM_ENABLE_ZLIB=ON \
+              -DLLDB_ENABLE_PYTHON=OFF \
+              -DLLDB_ENABLE_LUA=OFF \
+              -DLLDB_ENABLE_LZMA=OFF \
+              -DLLVM_INCLUDE_TESTS=OFF \
+              -DLLVM_INCLUDE_EXAMPLES=OFF \
+              -DLLVM_INCLUDE_BENCHMARKS=OFF \
+              -DLLVM_INCLUDE_DOCS=OFF \
+              -DCLANG_INCLUDE_TESTS=OFF \
+              -DLLDB_INCLUDE_TESTS=OFF \
+              -DLLVM_ENABLE_BINDINGS=OFF"
+
+          LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
+          cp -f "$LLVM_BUILD_DIR/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/"
+          cp -f "$LLVM_BUILD_DIR/bin/llvm-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
+          cp -f "$LLVM_BUILD_DIR/bin/clang-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
+          cp -rn "$LLVM_BUILD_DIR/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
+          cp -rn "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
+          cp -rn "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" || true
+
+      - name: 5. Empacotar Core SDK (${{ matrix.arch }})
+        run: |
+          cd /opt
+          tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/core-sdk-${{ matrix.arch }}.tar.zst omnillvm
+
+      - name: Upload Core SDK (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-sdk-${{ matrix.arch }}
+          path: core-sdk-${{ matrix.arch }}.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  # ============================================================================
+  # ESTÁGIO 2: Matrix 3x2 em Container Ubuntu 26.04 (Flang, Ada e Rust)
+  # ============================================================================
+  build-parallel-frontends:
+    name: "Stage 2: ${{ matrix.component }} [Ubuntu 26.04 - ${{ matrix.arch }}]"
+    needs: build-core
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:26.04
+      options: --privileged -v /opt:/opt
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [flang-mlir, gnat-ada, rust]
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+            rust_triple: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+            rust_triple: aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 1. Baixar Core SDK (${{ matrix.arch }})
+        uses: actions/download-artifact@v4
+        with:
+          name: core-sdk-${{ matrix.arch }}
+
+      - name: Extrair Core SDK e Configurar CPUs no Ubuntu 26.04
+        id: hw
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl git zstd xz-utils procps
+
+          CORES=$(nproc --all)
+          RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
+          LINK_JOBS=$(( (RAM_GB + 4) / 6 ))
+          if [ "$LINK_JOBS" -lt 1 ]; then LINK_JOBS=1; fi
+          echo "cores=$CORES" >> $GITHUB_OUTPUT
+          echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
+
+          mkdir -p /opt /opt/overlay-install
+          tar -I "zstd -T0" -xf core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
+          rm -f core-sdk-${{ matrix.arch }}.tar.zst
+
+      - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
+          max-size: 2G
+          compression-level: 6
+
+      # --- 3A. Flang + MLIR Dinâmicos ---
+      - name: 3A. Compilar Flang + MLIR Dinâmicos
+        if: matrix.component == 'flang-mlir'
+        run: |
+          apt-get install -y -qq --no-install-recommends cmake ninja-build clang lld mold ccache python3 zlib1g-dev
+
+          export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
+          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
+
+          mkdir -p $GITHUB_WORKSPACE/flang-src && cd $GITHUB_WORKSPACE/flang-src
+          git clone --filter=blob:none --no-checkout --depth 1 --branch swift/${{ env.SWIFT_SCHEME }} https://github.com/swiftlang/llvm-project.git
+          cd llvm-project
+          git sparse-checkout init --cone
+          git sparse-checkout set cmake llvm mlir flang clang
+          git checkout
+
+          cmake -G Ninja -S llvm -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="/opt/overlay-install" \
+            -DCMAKE_INSTALL_RPATH="\$ORIGIN/../lib:\$ORIGIN" \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_C_COMPILER="${{ env.INSTALL_PREFIX }}/bin/clang" \
+            -DCMAKE_CXX_COMPILER="${{ env.INSTALL_PREFIX }}/bin/clang++" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;RISCV" \
+            -DLLVM_ENABLE_PROJECTS="clang;mlir;flang" \
+            -DLLVM_USE_LINKER=mold \
+            -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.cores }} \
+            -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DCLANG_LINK_CLANG_DYLIB=ON \
+            -DMLIR_BUILD_MLIR_C_DYLIB=ON \
+            -DMLIR_LINK_MLIR_DYLIB=ON \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DFLANG_INCLUDE_TESTS=OFF \
+            -DMLIR_INCLUDE_TESTS=OFF
+
+          ninja -C build -j ${{ steps.hw.outputs.cores }} tools/flang/install
+          cp -a build/lib/libFortran* "/opt/overlay-install/lib/" 2>/dev/null || true
+          cp -a build/lib/libMLIR* "/opt/overlay-install/lib/" 2>/dev/null || true
+          cp -a build/lib/libflang* "/opt/overlay-install/lib/" 2>/dev/null || true
+
+      # --- 3B. GNAT-LLVM (Ada) Dinâmico ---
+      - name: 3B. Compilar GNAT-LLVM Dinâmico (Shared libLLVM.so)
+        if: matrix.component == 'gnat-ada'
+        run: |
+          apt-get install -y -qq --no-install-recommends gnat gprbuild cmake ninja-build ccache python3 zlib1g-dev
+
+          export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
+          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
+
+          mkdir -p $GITHUB_WORKSPACE/ada && cd $GITHUB_WORKSPACE/ada
+          git clone --depth 1 --branch master https://github.com/AdaCore/gnat-llvm.git
+          cd gnat-llvm
+          git clone --depth 1 --branch master https://github.com/AdaCore/llvm-bindings.git
+
+          git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
+          cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada && git checkout master && cd ../..
+          ln -s gcc/gcc/ada llvm-interface/gnat_src
+
+          sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
+
+          make -j${{ steps.hw.outputs.cores }} \
+            LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
+            PREFIX="/opt/overlay-install" \
+            all-rts
+
+          make \
+            LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
+            PREFIX="/opt/overlay-install" \
+            install-all
+
+      # --- 3C. Rustc + Cargo Dinâmicos ---
+      - name: 3C. Compilar Rustc Dinâmico (link-shared = true)
+        if: matrix.component == 'rust'
+        run: |
+          apt-get install -y -qq --no-install-recommends cmake ninja-build mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
+
+          export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
+          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
+
+          mkdir -p $GITHUB_WORKSPACE/rust-src && cd $GITHUB_WORKSPACE/rust-src
+          git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
+          cd rust
+
+          cat <<EOF > bootstrap.toml
+          change-id = "ignore"
+          profile = "compiler"
+
+          [llvm]
+          download-ci-llvm = false
+          link-shared = true
+
+          [build]
+          build = "${{ matrix.rust_triple }}"
+          host = ["${{ matrix.rust_triple }}"]
+          target = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "riscv64gc-unknown-linux-gnu"]
+          jobs = ${{ steps.hw.outputs.cores }}
+          docs = false
+          extended = true
+          tools = ["cargo"]
+          ccache = "ccache"
+
+          [install]
+          prefix = "/opt/overlay-install"
+
+          [rust]
+          lld = false
+          debug = false
+          debuginfo-level = 0
+          debuginfo-level-std = 1
+          codegen-units = ${{ steps.hw.outputs.cores }}
+          rpath = true
+
+          [target.${{ matrix.rust_triple }}]
+          llvm-config = "${{ env.INSTALL_PREFIX }}/bin/llvm-config"
+          cc = "${{ env.INSTALL_PREFIX }}/bin/clang"
+          cxx = "${{ env.INSTALL_PREFIX }}/bin/clang++"
+          linker = "${{ env.INSTALL_PREFIX }}/bin/clang"
+          EOF
+
+          python3 ./x.py build --stage 1 -j ${{ steps.hw.outputs.cores }}
+          python3 ./x.py install
+
+      - name: 4. Empacotar Overlay (${{ matrix.component }}-${{ matrix.arch }})
+        run: |
+          cd /opt/overlay-install
+          tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst .
+
+      - name: Upload do Overlay (${{ matrix.component }}-${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: overlay-${{ matrix.component }}-${{ matrix.arch }}
+          path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  # ============================================================================
+  # ESTÁGIO 3: Fusão, Deduplicação por Symlinks, RPATH ($ORIGIN) e Strip
+  # ============================================================================
+  package-arch:
+    name: "Stage 3: Merge & Strip [Ubuntu 26.04 - ${{ matrix.arch }}]"
+    needs: [build-core, build-parallel-frontends]
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:26.04
+      options: --privileged -v /opt:/opt
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+
+    steps:
+      - name: Baixar Artefatos (${{ matrix.arch }})
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-${{ matrix.arch }}"
+          path: artifacts
+
+      - name: Unificar, Deduplicar e Aplicar Strip Cirúrgico no Ubuntu 26.04
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks zstd file findutils
+
+          CORES=$(nproc --all)
+          mkdir -p /opt
+
+          # 1. Extrai a Base e os 3 Overlays na mesma árvore
+          tar -I "zstd -T0" -xf artifacts/core-sdk-${{ matrix.arch }}/core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
+          for comp in flang-mlir gnat-ada rust; do
+            tar -I "zstd -T0" -xf artifacts/overlay-${comp}-${{ matrix.arch }}/overlay-${comp}-${{ matrix.arch }}.tar.zst -C "${{ env.INSTALL_PREFIX }}/"
+          done
+          rm -rf artifacts
+
+          TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
+          STRIP="$TOOLCHAIN/bin/llvm-strip"
+
+          # 2. Aplica RPATH relativo ($ORIGIN) em todos os binários e libs para nunca exigir LD_LIBRARY_PATH
+          find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
+            xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN' 2>/dev/null || true
+
+          find "$TOOLCHAIN/lib" -maxdepth 2 -type f -name "*.so*" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
+            xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN:$ORIGIN/swift/linux:$ORIGIN/..' 2>/dev/null || true
+
+          # 3. Deduplicação física por Symlinks Relativos
+          rdfind -makesymlinks true -makeresultsfile false "$TOOLCHAIN"
+          symlinks -cr "$TOOLCHAIN"
+
+          # 4. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
+          find "$TOOLCHAIN/bin" -type f -print0 | xargs -0 -n 10 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
+          find "$TOOLCHAIN/lib" -maxdepth 1 -type f \( \
+            -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" \
+            -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
+          \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
+
+          # 5. Remove TODAS as bibliotecas estáticas (.a) internas do compilador
+          rm -f "$TOOLCHAIN/lib"/libLLVM*.a "$TOOLCHAIN/lib"/libclang*.a \
+                "$TOOLCHAIN/lib"/libMLIR*.a "$TOOLCHAIN/lib"/libFortran*.a \
+                "$TOOLCHAIN/lib"/liblldb*.a "$TOOLCHAIN/lib"/libflang*.a \
+                "$TOOLCHAIN/lib"/liblld*.a
+
+          # 6. Auditoria anti-libpython
+          echo "=== Verificando dependências dinâmicas do LLDB no Ubuntu 26.04 ==="
+          ldd "$TOOLCHAIN/bin/lldb"
+          if ldd "$TOOLCHAIN/bin/lldb" "$TOOLCHAIN/lib/liblldb.so"* | grep -q "libpython"; then
+            echo "ERRO FATAL: libpython encontrada no LLDB (${{ matrix.arch }})!"
+            exit 1
+          fi
+          echo "✅ Sucesso: LLDB 100% livre de libpython e compilado nativamente para Ubuntu 26.04!"
+
+          # 7. Compressão Final ZSTD Nível 19 Multi-Thread
+          cd /opt
+          tar -I "zstd -19 -T0" -cf $GITHUB_WORKSPACE/omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst omnillvm
+
+      - name: Upload do Pacote Final (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-pkg-${{ matrix.arch }}
+          path: omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  # ============================================================================
+  # ESTÁGIO 4: Publica AMD64 e ARM64 no GitHub Releases
+  # ============================================================================
+  publish-release:
+    name: "Stage 4: Publish Release (Ubuntu 26.04 AMD64 + ARM64)"
+    needs: package-arch
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Baixar Pacotes Finais
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "release-pkg-*"
+          merge-multiple: true
+
+      - name: Gerar Checksums SHA256
+        run: |
+          sha256sum omnillvm-toolchain-ubuntu26.04-*.tar.zst > SHA256SUMS.txt
+          ls -lh omnillvm-toolchain-ubuntu26.04-*.tar.zst
+          cat SHA256SUMS.txt
+
+      - name: Publicar no GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          name: "OmniLLVM Unified Toolchain (${{ inputs.release_tag || github.ref_name }}) [Ubuntu 26.04 | AMD64 & ARM64]"
+          files: |
+            omnillvm-toolchain-ubuntu26.04-amd64.tar.zst
+            omnillvm-toolchain-ubuntu26.04-arm64.tar.zst
+            SHA256SUMS.txt
