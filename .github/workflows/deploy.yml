@@ -70,6 +70,11 @@ jobs:
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
 
+          # Substitui o ld.bfd lento pelo ld.lld multi-thread como linker padrão de todo o sistema
+          ln -sf /usr/bin/ld.lld /usr/bin/ld
+          ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
+          ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
+
           # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap (mantendo o Clang 21 + mold/lld do Ubuntu 26.04)
           SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2404${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu24.04${{ matrix.swift_dir_arch }}.tar.gz"
           mkdir -p /opt/swift-bootstrap
@@ -78,6 +83,7 @@ jobs:
           ln -sf /usr/bin/clang /opt/swift-bootstrap/bin/clang
           ln -sf /usr/bin/clang++ /opt/swift-bootstrap/bin/clang++
           ln -sf /usr/bin/ld.lld /opt/swift-bootstrap/bin/ld.lld
+          ln -sf /usr/bin/ld.lld /opt/swift-bootstrap/bin/ld
           ln -sf /usr/bin/lld /opt/swift-bootstrap/bin/lld
           ln -sf /usr/bin/mold /opt/swift-bootstrap/bin/ld.mold
 
@@ -121,7 +127,7 @@ jobs:
           export TMPDIR="/tmp"
 
           # --no-assertions + -O3 gera um compilador ~30% mais rápido em execução e menor!
-          # -Wl,--undefined-version corrige o erro do lld 21 no IndexStore.exports
+          # -fuse-ld=lld -Wl,--undefined-version garante uso do LLD multi-thread em todos os subprojetos e corrige IndexStore.exports
           ./swift/utils/build-script \
             --release \
             --no-assertions \
@@ -139,9 +145,9 @@ jobs:
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
               -DCMAKE_CXX_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
-              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}' \
-              -DCMAKE_MODULE_LINKER_FLAGS='-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}' \
-              -DCMAKE_EXE_LINKER_FLAGS='-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}' \
+              -DCMAKE_SHARED_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version' \
+              -DCMAKE_MODULE_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version' \
+              -DCMAKE_EXE_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version' \
               -DCMAKE_INSTALL_RPATH='\$ORIGIN/../lib:\$ORIGIN' \
               -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
@@ -276,8 +282,8 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="/opt/overlay-install" \
             -DCMAKE_INSTALL_RPATH="\$ORIGIN/../lib:\$ORIGIN" \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}" \
-            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold -Wl,--undefined-version" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold -Wl,--undefined-version" \
             -DCMAKE_C_COMPILER="${{ env.INSTALL_PREFIX }}/bin/clang" \
             -DCMAKE_CXX_COMPILER="${{ env.INSTALL_PREFIX }}/bin/clang++" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
