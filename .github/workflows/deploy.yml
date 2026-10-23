@@ -1,16 +1,15 @@
 name: Build OmniLLVM Toolchain
 
 on:
+  push:
+    branches:
+      - '*'
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Tag da Release (ex: v1.0.0-ubuntu26.04)'
-        required: true
-        default: 'v1.0.0-ubuntu26.04'
-  push:
-    tags:
-      - 'v*-llvm*'
-      - 'v*-ubuntu*'
+        description: 'Versão da Release (deixe vazio para auto-incrementar: 1, 2, 3...)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -48,10 +47,12 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-26.04
+            llvm_build_subdir: "llvm-linux-x86_64"
             swift_url_arch: ""
             swift_dir_arch: ""
           - arch: arm64
             runner: ubuntu-26.04-arm
+            llvm_build_subdir: "llvm-linux-aarch64"
             swift_url_arch: "-aarch64"
             swift_dir_arch: "-aarch64"
 
@@ -126,8 +127,19 @@ jobs:
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export TMPDIR="/tmp"
 
-          # --no-assertions + -O3 gera um compilador ~30% mais rápido em execução e menor!
-          # -fuse-ld=lld -Wl,--undefined-version garante uso do LLD multi-thread em todos os subprojetos e corrige IndexStore.exports
+          # Prepara o diretório de lib do LLVM e cria symlink em /opt/swift-bootstrap/lib/swift/linux
+          # (pois o CMake do Swift força LD_LIBRARY_PATH=/opt/swift-bootstrap/lib/swift/linux ao compilar Swift.o!)
+          LLVM_LIB_BUILD="$GITHUB_WORKSPACE/src/build/Ninja-Release/${{ matrix.llvm_build_subdir }}/lib"
+          mkdir -p "$LLVM_LIB_BUILD"
+          for so in libLLVM.so libLLVM.so.21.0 libLLVM-21.so libclang-cpp.so libclang-cpp.so.21.0 libclang.so libclang.so.21.0 libLTO.so libLTO.so.21.0 libRemarks.so libRemarks.so.21.0; do
+            ln -sf "$LLVM_LIB_BUILD/$so" "/opt/swift-bootstrap/lib/swift/linux/$so"
+            ln -sf "$LLVM_LIB_BUILD/$so" "/usr/lib/$so"
+          done
+
+          # Inclui também $ORIGIN/../../llvm-linux-*/lib no RPATH de compilação para que swift-frontend e libSwiftScan
+          # sempre achem libLLVM.so.21.0 diretamente na árvore de build antes mesmo da instalação!
+          BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN:\$ORIGIN/../../${{ matrix.llvm_build_subdir }}/lib"
+
           ./swift/utils/build-script \
             --release \
             --no-assertions \
@@ -145,10 +157,10 @@ jobs:
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
               -DCMAKE_CXX_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
-              -DCMAKE_SHARED_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version' \
-              -DCMAKE_MODULE_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version' \
-              -DCMAKE_EXE_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version' \
-              -DCMAKE_INSTALL_RPATH='\$ORIGIN/../lib:\$ORIGIN' \
+              -DCMAKE_SHARED_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
+              -DCMAKE_MODULE_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
+              -DCMAKE_EXE_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
+              -DCMAKE_INSTALL_RPATH='${BUILD_RPATH}' \
               -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
               -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld' \
@@ -459,7 +471,7 @@ jobs:
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
           STRIP="$TOOLCHAIN/bin/llvm-strip"
 
-          # 2. Aplica RPATH relativo ($ORIGIN) em todos os binários e libs para nunca exigir LD_LIBRARY_PATH
+          # 2. Aplica RPATH relativo limpo ($ORIGIN) em todos os binários e libs para nunca exigir LD_LIBRARY_PATH
           find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
             xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN' 2>/dev/null || true
 
@@ -505,7 +517,7 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # ESTÁGIO 4: Publica AMD64 e ARM64 no GitHub Releases
+  # ESTÁGIO 4: Publica AMD64 e ARM64 com Versão Inteira Sequencial (1, 2, 3...)
   # ============================================================================
   publish-release:
     name: "Stage 4: Publish Release (Ubuntu 26.04 AMD64 + ARM64)"
@@ -514,14 +526,35 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Checkout (para consultar tags existentes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Baixar Pacotes Finais
         uses: actions/download-artifact@v4
         with:
           pattern: "release-pkg-*"
           merge-multiple: true
 
-      - name: Gerar Checksums SHA256
+      - name: Calcular Próxima Versão Inteira (1, 2, 3...) e Checksums SHA256
+        id: meta
         run: |
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            NEXT_VER="${{ inputs.release_tag }}"
+          else
+            # Busca todas as tags que são números inteiros puros (ex: 1, 2, 3...) no repositório remoto
+            LAST_VER=$(git ls-remote --tags --refs origin | awk -F'refs/tags/' '{print $2}' | grep -E '^[0-9]+$' | sort -n | tail -n 1)
+            if [ -z "$LAST_VER" ]; then
+              NEXT_VER=1
+            else
+              NEXT_VER=$(( LAST_VER + 1 ))
+            fi
+          fi
+
+          echo " Publicando Release Versão: $NEXT_VER"
+          echo "tag=$NEXT_VER" >> $GITHUB_OUTPUT
+
           sha256sum omnillvm-toolchain-ubuntu26.04-*.tar.zst > SHA256SUMS.txt
           ls -lh omnillvm-toolchain-ubuntu26.04-*.tar.zst
           cat SHA256SUMS.txt
@@ -529,8 +562,9 @@ jobs:
       - name: Publicar no GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
-          name: "OmniLLVM Unified Toolchain (${{ inputs.release_tag || github.ref_name }}) [Ubuntu 26.04 | AMD64 & ARM64]"
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "OmniLLVM Unified Toolchain - Release ${{ steps.meta.outputs.tag }} [Ubuntu 26.04 | AMD64 & ARM64]"
           files: |
             omnillvm-toolchain-ubuntu26.04-amd64.tar.zst
             omnillvm-toolchain-ubuntu26.04-arm64.tar.zst
