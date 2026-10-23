@@ -21,7 +21,14 @@ env:
   SWIFT_BOOTSTRAP_VER: 6.0.3
   RUST_BRANCH: 1.91.0
   DEBIAN_FRONTEND: noninteractive
-  HOST_FAST_FLAGS: "-O2 -pipe -fno-plt -g0 -DNDEBUG -Wl,-rpath,\\$ORIGIN/../lib:\\$ORIGIN"
+  # Otimização MÁXIMA para o binário final (-O3 -fno-plt) + I/O em RAM (-pipe) + zero peso morto (-g0 -DNDEBUG)
+  MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
+  # ccache configurado em memória RAM (/dev/shm) para latência zero
+  CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
+  CCACHE_COMPRESS: "true"
+  CCACHE_COMPRESSLEVEL: "1"
+  CCACHE_COMPILERCHECK: "content"
+  CCACHE_SLOPPINESS: "pch_defines,time_macros"
 
 jobs:
   # ============================================================================
@@ -32,8 +39,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
-      options: --privileged -v /opt:/opt
-    timeout-minutes: 180
+      # --shm-size=8g + tmpfs em /tmp coloca todos os arquivos temporários dos compiladores na RAM!
+      options: --privileged -v /opt:/opt --shm-size=8g --mount type=tmpfs,destination=/tmp,tmpfs-size=6g
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +56,7 @@ jobs:
             swift_dir_arch: "-aarch64"
 
     steps:
-      - name: 1. Instalar Dependências, Swift Host Bootstrap e Tuning de RAM
+      - name: 1. Instalar Dependências, Swift Host Bootstrap e Tuning Máximo de CPU/RAM
         id: hw
         run: |
           apt-get update -qq
@@ -60,9 +68,9 @@ jobs:
 
           # Garante fisicamente que nenhum header dev do Python ou SWIG exista no container Ubuntu 26.04
           apt-get remove -y libpython3*-dev swig* || true
-          mkdir -p ${{ env.INSTALL_PREFIX }}
+          mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
 
-          # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap (mantendo o Clang 21 do Ubuntu 26.04)
+          # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap (mantendo o Clang 21 + mold/lld do Ubuntu 26.04)
           SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2404${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu24.04${{ matrix.swift_dir_arch }}.tar.gz"
           mkdir -p /opt/swift-bootstrap
           curl -fsSL "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
@@ -71,14 +79,17 @@ jobs:
           ln -sf /usr/bin/clang++ /opt/swift-bootstrap/bin/clang++
           ln -sf /usr/bin/ld.lld /opt/swift-bootstrap/bin/ld.lld
           ln -sf /usr/bin/lld /opt/swift-bootstrap/bin/lld
+          ln -sf /usr/bin/mold /opt/swift-bootstrap/bin/ld.mold
 
           CORES=$(nproc --all)
+          # CORES + 2 mantém os processadores em 100% mesmo durante microssegundos de I/O
+          COMPILE_JOBS=$(( CORES + 2 ))
           RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
-          LINK_JOBS=$(( (RAM_GB + 4) / 4 ))
-          if [ "$LINK_JOBS" -lt 2 ]; then LINK_JOBS=2; fi
-          if [ "$LINK_JOBS" -gt "$CORES" ]; then LINK_JOBS=$CORES; fi
+          LINK_JOBS=$CORES
 
+          echo "Detectado: ${CORES} vCPUs (Compile Jobs: ${COMPILE_JOBS} | Link Jobs: ${LINK_JOBS}) | ${RAM_GB} GB RAM"
           echo "cores=$CORES" >> $GITHUB_OUTPUT
+          echo "compile_jobs=$COMPILE_JOBS" >> $GITHUB_OUTPUT
           echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
 
       - name: Checkout
@@ -88,49 +99,56 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: omnillvm-u2604-core-${{ matrix.arch }}
+          restore-keys: |
+            omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
 
-      - name: 3. Clonar Swift + LLVM 21
+      - name: 3. Clonar Swift + LLVM 21 em Paralelo
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
           git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
-          ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.cores }}
+          ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
 
-      - name: 4. Compilar Core 100% Dinâmico (libLLVM.so + libclang-cpp.so + liblldb.so)
+      - name: 4. Compilar Core 100% Dinâmico com Otimização Máxima (-O3 + --no-assertions)
         run: |
           cd $GITHUB_WORKSPACE/src
 
-          # Coloca /usr/bin ANTES de /opt/swift-bootstrap/bin e força Clang 21 nativo do Ubuntu 26.04
           export PATH="/usr/bin:/bin:/opt/swift-bootstrap/bin:$PATH"
           export CC=/usr/bin/clang
           export CXX=/usr/bin/clang++
+          export CFLAGS="${{ env.MAX_OPT_FLAGS }}"
+          export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
+          export TMPDIR="/tmp"
 
-          # Nota importante:
-          # 1. 'lldb' é construído pelo build-script via flag --lldb (após o Swift).
-          # 2. Não passamos -DLLVM_INCLUDE_TESTS=OFF porque o build-script exige o target 'LLVMTestingSupport'
-          #    quando --lldb está ativo (os testes em si NÃO são compilados nem rodados sem a flag --test).
+          # --no-assertions + -O3 gera um compilador ~30% mais rápido em execução e menor!
+          # -Wl,--undefined-version corrige o erro do lld 21 no IndexStore.exports
           ./swift/utils/build-script \
             --release \
-            --assertions \
+            --no-assertions \
             --no-swift-stdlib-assertions \
             --bootstrapping=hosttools \
             --host-cc=/usr/bin/clang \
             --host-cxx=/usr/bin/clang++ \
             --lldb \
-            --jobs ${{ steps.hw.outputs.cores }} \
+            --jobs ${{ steps.hw.outputs.compile_jobs }} \
             --install-all \
             --install-destdir="${{ env.INSTALL_PREFIX }}" \
             --install-prefix="/" \
             --extra-cmake-options="\
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
+              -DCMAKE_CXX_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
+              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}' \
+              -DCMAKE_MODULE_LINKER_FLAGS='-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}' \
+              -DCMAKE_EXE_LINKER_FLAGS='-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}' \
               -DCMAKE_INSTALL_RPATH='\$ORIGIN/../lib:\$ORIGIN' \
               -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
               -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld' \
               -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind' \
               -DLLVM_USE_LINKER=lld \
-              -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.cores }} \
+              -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
               -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
               -DLLVM_BUILD_LLVM_DYLIB=ON \
               -DLLVM_LINK_LLVM_DYLIB=ON \
@@ -147,10 +165,8 @@ jobs:
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
               -DLLVM_ENABLE_BINDINGS=OFF"
 
-          # Remove o compilador de bootstrap temporário
           rm -rf /opt/swift-bootstrap
 
-          # Se algum subprojeto (como cmark) instalou em usr/local dentro do destdir, unifica na raiz do prefixo
           if [ -d "${{ env.INSTALL_PREFIX }}/usr/local" ]; then
             cp -rn "${{ env.INSTALL_PREFIX }}/usr/local/"* "${{ env.INSTALL_PREFIX }}/" || true
             rm -rf "${{ env.INSTALL_PREFIX }}/usr"
@@ -189,8 +205,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
-      options: --privileged -v /opt:/opt
-    timeout-minutes: 150
+      options: --privileged -v /opt:/opt --shm-size=8g --mount type=tmpfs,destination=/tmp,tmpfs-size=6g
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -212,20 +228,19 @@ jobs:
         with:
           name: core-sdk-${{ matrix.arch }}
 
-      - name: Extrair Core SDK e Configurar CPUs no Ubuntu 26.04
+      - name: Extrair Core SDK e Configurar CPUs/RAM no Ubuntu 26.04
         id: hw
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends ca-certificates curl git zstd xz-utils procps
 
           CORES=$(nproc --all)
-          RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
-          LINK_JOBS=$(( (RAM_GB + 4) / 6 ))
-          if [ "$LINK_JOBS" -lt 1 ]; then LINK_JOBS=1; fi
+          COMPILE_JOBS=$(( CORES + 2 ))
           echo "cores=$CORES" >> $GITHUB_OUTPUT
-          echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
+          echo "compile_jobs=$COMPILE_JOBS" >> $GITHUB_OUTPUT
+          echo "link_jobs=$CORES" >> $GITHUB_OUTPUT
 
-          mkdir -p /opt /opt/overlay-install
+          mkdir -p /opt /opt/overlay-install /dev/shm/ccache-tmp
           tar -I "zstd -T0" -xf core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
           rm -f core-sdk-${{ matrix.arch }}.tar.zst
 
@@ -233,16 +248,19 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
+          restore-keys: |
+            omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
           max-size: 2G
 
-      # --- 3A. Flang + MLIR Dinâmicos ---
-      - name: 3A. Compilar Flang + MLIR Dinâmicos
+      # --- 3A. Flang + MLIR Dinâmicos (-O3 + mold) ---
+      - name: 3A. Compilar Flang + MLIR Dinâmicos (-O3)
         if: matrix.component == 'flang-mlir'
         run: |
           apt-get install -y -qq --no-install-recommends cmake ninja-build clang lld mold ccache python3 zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
+          export TMPDIR="/tmp"
 
           mkdir -p $GITHUB_WORKSPACE/flang-src && cd $GITHUB_WORKSPACE/flang-src
           git clone --filter=blob:none --no-checkout --depth 1 --branch swift/${{ env.SWIFT_SCHEME }} https://github.com/swiftlang/llvm-project.git
@@ -253,17 +271,22 @@ jobs:
 
           cmake -G Ninja -S llvm -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${{ env.MAX_OPT_FLAGS }}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${{ env.MAX_OPT_FLAGS }}" \
             -DCMAKE_INSTALL_PREFIX="/opt/overlay-install" \
             -DCMAKE_INSTALL_RPATH="\$ORIGIN/../lib:\$ORIGIN" \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--undefined-version -Wl,--threads=${{ steps.hw.outputs.cores }}" \
             -DCMAKE_C_COMPILER="${{ env.INSTALL_PREFIX }}/bin/clang" \
             -DCMAKE_CXX_COMPILER="${{ env.INSTALL_PREFIX }}/bin/clang++" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_TARGETS_TO_BUILD="X86;AArch64;RISCV" \
             -DLLVM_ENABLE_PROJECTS="clang;mlir;flang" \
             -DLLVM_USE_LINKER=mold \
-            -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.cores }} \
+            -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
             -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
             -DLLVM_BUILD_LLVM_DYLIB=ON \
             -DLLVM_LINK_LLVM_DYLIB=ON \
@@ -278,12 +301,12 @@ jobs:
             -DFLANG_INCLUDE_TESTS=OFF \
             -DMLIR_INCLUDE_TESTS=OFF
 
-          ninja -C build -j ${{ steps.hw.outputs.cores }} tools/flang/install
+          ninja -C build -j ${{ steps.hw.outputs.compile_jobs }} tools/flang/install
           cp -a build/lib/libFortran* "/opt/overlay-install/lib/" 2>/dev/null || true
           cp -a build/lib/libMLIR* "/opt/overlay-install/lib/" 2>/dev/null || true
           cp -a build/lib/libflang* "/opt/overlay-install/lib/" 2>/dev/null || true
 
-      # --- 3B. GNAT-LLVM (Ada) Dinâmico ---
+      # --- 3B. GNAT-LLVM (Ada) Dinâmico (-O3 + Multi-core total) ---
       - name: 3B. Compilar GNAT-LLVM Dinâmico (Shared libLLVM.so)
         if: matrix.component == 'gnat-ada'
         run: |
@@ -291,6 +314,7 @@ jobs:
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
+          export TMPDIR="/tmp"
 
           mkdir -p $GITHUB_WORKSPACE/ada && cd $GITHUB_WORKSPACE/ada
           git clone --depth 1 --branch master https://github.com/AdaCore/gnat-llvm.git
@@ -303,24 +327,28 @@ jobs:
 
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
 
-          make -j${{ steps.hw.outputs.cores }} \
+          make -j${{ steps.hw.outputs.compile_jobs }} \
+            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
             all-rts
 
-          make \
+          make -j${{ steps.hw.outputs.compile_jobs }} \
+            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
             install-all
 
-      # --- 3C. Rustc + Cargo Dinâmicos ---
-      - name: 3C. Compilar Rustc Dinâmico (link-shared = true)
+      # --- 3C. Rustc + Cargo Dinâmicos (-O3 + mold) ---
+      - name: 3C. Compilar Rustc Dinâmico (link-shared = true + mold)
         if: matrix.component == 'rust'
         run: |
           apt-get install -y -qq --no-install-recommends cmake ninja-build mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
+          export TMPDIR="/tmp"
+          export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
           mkdir -p $GITHUB_WORKSPACE/rust-src && cd $GITHUB_WORKSPACE/rust-src
           git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
@@ -338,7 +366,7 @@ jobs:
           build = "${{ matrix.rust_triple }}"
           host = ["${{ matrix.rust_triple }}"]
           target = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "riscv64gc-unknown-linux-gnu"]
-          jobs = ${{ steps.hw.outputs.cores }}
+          jobs = ${{ steps.hw.outputs.compile_jobs }}
           docs = false
           extended = true
           tools = ["cargo"]
@@ -348,8 +376,10 @@ jobs:
           prefix = "/opt/overlay-install"
 
           [rust]
+          optimize = true
           lld = false
           debug = false
+          debug-assertions = false
           debuginfo-level = 0
           debuginfo-level-std = 1
           codegen-units = ${{ steps.hw.outputs.cores }}
@@ -362,7 +392,7 @@ jobs:
           linker = "${{ env.INSTALL_PREFIX }}/bin/clang"
           EOF
 
-          python3 ./x.py build --stage 1 -j ${{ steps.hw.outputs.cores }}
+          python3 ./x.py build --stage 1 -j ${{ steps.hw.outputs.compile_jobs }}
           python3 ./x.py install
 
       - name: 4. Empacotar Overlay (${{ matrix.component }}-${{ matrix.arch }})
