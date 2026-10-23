@@ -62,11 +62,15 @@ jobs:
           apt-get remove -y libpython3*-dev || true
           mkdir -p ${{ env.INSTALL_PREFIX }}
 
-          # Baixa um compilador Swift pré-compilado apenas para o bootstrap (exigido pelo Swift 6.3 --bootstrapping=hosttools)
+          # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap (removendo o clang antigo dele para não conflitar com o Clang 21 do Ubuntu 26.04)
           SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2404${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu24.04${{ matrix.swift_dir_arch }}.tar.gz"
           mkdir -p /opt/swift-bootstrap
           curl -fsSL "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
-          echo "/opt/swift-bootstrap/bin" >> $GITHUB_PATH
+          rm -f /opt/swift-bootstrap/bin/clang* /opt/swift-bootstrap/bin/lld* /opt/swift-bootstrap/bin/ld* /opt/swift-bootstrap/bin/lldb*
+          ln -sf /usr/bin/clang /opt/swift-bootstrap/bin/clang
+          ln -sf /usr/bin/clang++ /opt/swift-bootstrap/bin/clang++
+          ln -sf /usr/bin/ld.lld /opt/swift-bootstrap/bin/ld.lld
+          ln -sf /usr/bin/lld /opt/swift-bootstrap/bin/lld
 
           CORES=$(nproc --all)
           RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
@@ -96,16 +100,23 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/src
 
+          # Coloca /usr/bin ANTES de /opt/swift-bootstrap/bin e força Clang 21 nativo do Ubuntu 26.04
+          export PATH="/usr/bin:/bin:/opt/swift-bootstrap/bin:$PATH"
+          export CC=/usr/bin/clang
+          export CXX=/usr/bin/clang++
+
           ./swift/utils/build-script \
             --release \
             --assertions \
             --no-swift-stdlib-assertions \
             --bootstrapping=hosttools \
+            --host-cc=/usr/bin/clang \
+            --host-cxx=/usr/bin/clang++ \
             --lldb \
             --jobs ${{ steps.hw.outputs.cores }} \
             --install-all \
-            --install-destdir="/" \
-            --install-prefix="${{ env.INSTALL_PREFIX }}" \
+            --install-destdir="${{ env.INSTALL_PREFIX }}" \
+            --install-prefix="/" \
             --extra-cmake-options="\
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -134,8 +145,14 @@ jobs:
               -DLLDB_INCLUDE_TESTS=OFF \
               -DLLVM_ENABLE_BINDINGS=OFF"
 
-          # Remove o compilador de bootstrap temporário para não ocupar espaço
+          # Remove o compilador de bootstrap temporário
           rm -rf /opt/swift-bootstrap
+
+          # Se algum subprojeto (como cmark) instalou em usr/local dentro do destdir, unifica na raiz do prefixo
+          if [ -d "${{ env.INSTALL_PREFIX }}/usr/local" ]; then
+            cp -rn "${{ env.INSTALL_PREFIX }}/usr/local/"* "${{ env.INSTALL_PREFIX }}/" || true
+            rm -rf "${{ env.INSTALL_PREFIX }}/usr"
+          fi
 
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
           mkdir -p "${{ env.INSTALL_PREFIX }}/bin" "${{ env.INSTALL_PREFIX }}/include" "${{ env.INSTALL_PREFIX }}/lib"
