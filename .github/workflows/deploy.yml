@@ -74,7 +74,6 @@ jobs:
         with:
           key: omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
-          compression-level: 6
 
       - name: 3. Clonar Swift + LLVM 21
         run: |
@@ -90,12 +89,12 @@ jobs:
             --release \
             --assertions \
             --no-swift-stdlib-assertions \
+            --bootstrapping=off \
             --lldb \
-            --lld \
             --jobs ${{ steps.hw.outputs.cores }} \
             --install-all \
-            --install-destdir="${{ env.INSTALL_PREFIX }}" \
-            --install-prefix="" \
+            --install-destdir="/" \
+            --install-prefix="${{ env.INSTALL_PREFIX }}" \
             --extra-cmake-options="\
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -125,9 +124,12 @@ jobs:
               -DLLVM_ENABLE_BINDINGS=OFF"
 
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
+          mkdir -p "${{ env.INSTALL_PREFIX }}/bin" "${{ env.INSTALL_PREFIX }}/include" "${{ env.INSTALL_PREFIX }}/lib"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
           cp -f "$LLVM_BUILD_DIR/bin/clang-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
+          cp -f "$LLVM_BUILD_DIR/bin/lld" "${{ env.INSTALL_PREFIX }}/bin/" || true
+          ln -sf lld "${{ env.INSTALL_PREFIX }}/bin/ld.lld" || true
           cp -rn "$LLVM_BUILD_DIR/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
           cp -rn "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
           cp -rn "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" || true
@@ -199,7 +201,6 @@ jobs:
         with:
           key: omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
           max-size: 2G
-          compression-level: 6
 
       # --- 3A. Flang + MLIR Dinâmicos ---
       - name: 3A. Compilar Flang + MLIR Dinâmicos
@@ -403,7 +404,7 @@ jobs:
           # 4. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
           find "$TOOLCHAIN/bin" -type f -print0 | xargs -0 -n 10 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
           find "$TOOLCHAIN/lib" -maxdepth 1 -type f \( \
-            -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" \
+            -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" -o \
             -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
           \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
 
