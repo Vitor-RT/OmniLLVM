@@ -127,10 +127,6 @@ jobs:
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export TMPDIR="/tmp"
 
-          # Nota crucial:
-          # - -DLLVM_BUILD_LLVM_DYLIB=ON constrói a libLLVM.so.21.0 compartilhada (para Flang, Ada e Rust).
-          # - -DLLVM_LINK_LLVM_DYLIB=OFF evita colisão estática+dinâmica no lib_InternalSwiftScan.so.
-          # - -DLLDB_INCLUDE_TESTS=OFF impede que o build standalone do LLDB procure o target 'runtimes' em lldb/test.
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN"
 
           ./swift/utils/build-script \
@@ -145,6 +141,7 @@ jobs:
             --install-all \
             --install-destdir="${{ env.INSTALL_PREFIX }}" \
             --install-prefix="/" \
+            --cross-compile-append-host-target-to-destdir=False \
             --extra-cmake-options="\
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -179,26 +176,40 @@ jobs:
 
           rm -rf /opt/swift-bootstrap
 
-          if [ -d "${{ env.INSTALL_PREFIX }}/usr/local" ]; then
-            cp -rn "${{ env.INSTALL_PREFIX }}/usr/local/"* "${{ env.INSTALL_PREFIX }}/" || true
-            rm -rf "${{ env.INSTALL_PREFIX }}/usr"
-          fi
-
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
-          # Garante que a libLLVM.so.21.0 e a libclang-cpp.so.21.0 sejam construídas e copiadas para o SDK
+          SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
+          LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
+
+          # Garante que LLVM, Clang, LLD, Swift, LLDB e libLLVM.so sejam instalados integralmente em INSTALL_PREFIX
           ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp
+          DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR" install
+          if [ -n "$SWIFT_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$SWIFT_BUILD_DIR" install || true; fi
+          if [ -n "$LLDB_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLDB_BUILD_DIR" install || true; fi
+
+          # Achata qualquer subdiretório usr/local ou local ou linux-* criado pelo DESTDIR
+          for sub in usr/local usr local linux-x86_64 linux-aarch64; do
+            if [ -d "${{ env.INSTALL_PREFIX }}/$sub" ]; then
+              cp -af "${{ env.INSTALL_PREFIX }}/$sub/"* "${{ env.INSTALL_PREFIX }}/" 2>/dev/null || true
+              rm -rf "${{ env.INSTALL_PREFIX }}/$sub"
+            fi
+          done
 
           mkdir -p "${{ env.INSTALL_PREFIX }}/bin" "${{ env.INSTALL_PREFIX }}/include" "${{ env.INSTALL_PREFIX }}/lib"
           cp -af "$LLVM_BUILD_DIR/lib/libLLVM"*".so"* "${{ env.INSTALL_PREFIX }}/lib/"
           cp -af "$LLVM_BUILD_DIR/lib/libclang"*".so"* "${{ env.INSTALL_PREFIX }}/lib/" || true
+          cp -af "$LLVM_BUILD_DIR/bin/clang"* "${{ env.INSTALL_PREFIX }}/bin/"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
           cp -f "$LLVM_BUILD_DIR/bin/clang-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
           cp -f "$LLVM_BUILD_DIR/bin/lld" "${{ env.INSTALL_PREFIX }}/bin/" || true
           ln -sf lld "${{ env.INSTALL_PREFIX }}/bin/ld.lld" || true
+          ln -sf clang "${{ env.INSTALL_PREFIX }}/bin/clang++" || true
           cp -rn "$LLVM_BUILD_DIR/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
           cp -rn "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
           cp -rn "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" || true
+
+          # Validação imediata para garantir que clang e llvm-config existem em /opt/omnillvm/bin
+          ls -la "${{ env.INSTALL_PREFIX }}/bin/clang" "${{ env.INSTALL_PREFIX }}/bin/clang++" "${{ env.INSTALL_PREFIX }}/bin/llvm-config"
 
       - name: 5. Empacotar Core SDK (${{ matrix.arch }})
         run: |
@@ -260,6 +271,14 @@ jobs:
           mkdir -p /opt /opt/overlay-install /dev/shm/ccache-tmp
           tar -I "zstd -T0" -xf core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
           rm -f core-sdk-${{ matrix.arch }}.tar.zst
+
+          # Garante que qualquer subpasta residual (local, usr, linux-*) seja mesclada na raiz de /opt/omnillvm
+          for sub in usr/local usr local linux-x86_64 linux-aarch64; do
+            if [ -d "${{ env.INSTALL_PREFIX }}/$sub" ]; then
+              cp -af "${{ env.INSTALL_PREFIX }}/$sub/"* "${{ env.INSTALL_PREFIX }}/" 2>/dev/null || true
+              rm -rf "${{ env.INSTALL_PREFIX }}/$sub"
+            fi
+          done
 
       - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
         uses: hendrikmuhs/ccache-action@v1.2
@@ -327,19 +346,20 @@ jobs:
       - name: 3B. Compilar GNAT-LLVM Dinâmico (Shared libLLVM.so)
         if: matrix.component == 'gnat-ada'
         run: |
-          apt-get install -y -qq --no-install-recommends gnat gprbuild cmake ninja-build ccache python3 zlib1g-dev
+          apt-get install -y -qq --no-install-recommends gnat gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
           export TMPDIR="/tmp"
 
           mkdir -p $GITHUB_WORKSPACE/ada && cd $GITHUB_WORKSPACE/ada
-          git clone --depth 1 --branch master https://github.com/AdaCore/gnat-llvm.git
+          # Clona usando a branch default (main/master) sem fixar 'master' que não existe mais no llvm-bindings
+          git clone --depth 1 https://github.com/AdaCore/gnat-llvm.git
           cd gnat-llvm
-          git clone --depth 1 --branch master https://github.com/AdaCore/llvm-bindings.git
+          git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
 
           git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
-          cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada && git checkout master && cd ../..
+          cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
@@ -360,7 +380,7 @@ jobs:
       - name: 3C. Compilar Rustc Dinâmico (link-shared = true + mold)
         if: matrix.component == 'rust'
         run: |
-          apt-get install -y -qq --no-install-recommends cmake ninja-build mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
+          apt-get install -y -qq --no-install-recommends cmake ninja-build clang mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
