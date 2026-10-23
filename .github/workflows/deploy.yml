@@ -105,9 +105,10 @@ jobs:
           export CC=/usr/bin/clang
           export CXX=/usr/bin/clang++
 
-          # Nota: 'lldb' NÃO deve ir em -DLLVM_ENABLE_PROJECTS porque o build-script do Swift
-          # compila o LLDB separadamente via flag --lldb DEPOIS que o Swift e seus módulos CMake
-          # (SwiftAddCustomCommandTarget) já estão prontos.
+          # Nota importante:
+          # 1. 'lldb' é construído pelo build-script via flag --lldb (após o Swift).
+          # 2. Não passamos -DLLVM_INCLUDE_TESTS=OFF porque o build-script exige o target 'LLVMTestingSupport'
+          #    quando --lldb está ativo (os testes em si NÃO são compilados nem rodados sem a flag --test).
           ./swift/utils/build-script \
             --release \
             --assertions \
@@ -142,12 +143,8 @@ jobs:
               -DLLDB_ENABLE_LUA=OFF \
               -DLLDB_ENABLE_LZMA=OFF \
               -DLLDB_ENABLE_LIBXML2=OFF \
-              -DLLVM_INCLUDE_TESTS=OFF \
               -DLLVM_INCLUDE_EXAMPLES=OFF \
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
-              -DLLVM_INCLUDE_DOCS=OFF \
-              -DCLANG_INCLUDE_TESTS=OFF \
-              -DLLDB_INCLUDE_TESTS=OFF \
               -DLLVM_ENABLE_BINDINGS=OFF"
 
           # Remove o compilador de bootstrap temporário
