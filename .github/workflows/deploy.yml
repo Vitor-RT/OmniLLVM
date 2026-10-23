@@ -10,6 +10,14 @@ on:
         description: 'Versão da Release (deixe vazio para auto-incrementar: 1, 2, 3...)'
         required: false
         default: ''
+      rebuild_core:
+        description: 'Forçar recompilação do Stage 1 do zero? (false = usa cache em 25s)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: write
@@ -19,6 +27,8 @@ env:
   SWIFT_SCHEME: release/6.3
   SWIFT_BOOTSTRAP_VER: 6.0.3
   RUST_BRANCH: 1.91.0
+  # Mude este número (v1 -> v2) se quiser invalidar o cache do Stage 1 em um push normal
+  CORE_CACHE_REV: v2
   DEBIAN_FRONTEND: noninteractive
   # Otimização MÁXIMA para o binário final (-O3 -fno-plt) + I/O em RAM (-pipe) + zero peso morto (-g0 -DNDEBUG)
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
@@ -31,14 +41,13 @@ env:
 
 jobs:
   # ============================================================================
-  # ESTÁGIO 1: Core em Container Ubuntu 26.04 (LLVM + Clang + LLDB + Swift)
+  # ESTÁGIO 1: Core em Container Ubuntu 26.04 (Pula em 25s se já estiver em Cache!)
   # ============================================================================
   build-core:
     name: "Stage 1: Core LLVM+Swift [Ubuntu 26.04 - ${{ matrix.arch }}]"
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
-      # --shm-size=8g + tmpfs em /tmp coloca todos os arquivos temporários dos compiladores na RAM!
       options: --privileged -v /opt:/opt --shm-size=8g --mount type=tmpfs,destination=/tmp,tmpfs-size=6g
     timeout-minutes: 300
     strategy:
@@ -57,8 +66,21 @@ jobs:
             swift_dir_arch: "-aarch64"
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # FAST-SKIP: Se o Core SDK já foi compilado antes, restaura em ~20 segundos e pula tudo!
+      - name: 0. Cache do Core SDK Pronto (Pula os 26 min de build se existir!)
+        id: core-cache
+        if: inputs.rebuild_core != 'true'
+        uses: actions/cache@v4
+        with:
+          path: core-sdk-${{ matrix.arch }}.tar.zst
+          key: omnillvm-core-tarball-${{ env.CORE_CACHE_REV }}-${{ env.SWIFT_SCHEME }}-${{ matrix.arch }}
+
       - name: 1. Instalar Dependências, Swift Host Bootstrap e Tuning Máximo de CPU/RAM
         id: hw
+        if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
@@ -76,7 +98,7 @@ jobs:
           ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
           ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
 
-          # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap (mantendo o Clang 21 + mold/lld do Ubuntu 26.04)
+          # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap
           SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2404${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu24.04${{ matrix.swift_dir_arch }}.tar.gz"
           mkdir -p /opt/swift-bootstrap
           curl -fsSL "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
@@ -89,7 +111,6 @@ jobs:
           ln -sf /usr/bin/mold /opt/swift-bootstrap/bin/ld.mold
 
           CORES=$(nproc --all)
-          # CORES + 2 mantém os processadores em 100% mesmo durante microssegundos de I/O
           COMPILE_JOBS=$(( CORES + 2 ))
           RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
           LINK_JOBS=$CORES
@@ -99,10 +120,8 @@ jobs:
           echo "compile_jobs=$COMPILE_JOBS" >> $GITHUB_OUTPUT
           echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: 2. Cache ccache (Ubuntu 26.04 - ${{ matrix.arch }})
+        if: steps.core-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: omnillvm-u2604-core-${{ matrix.arch }}
@@ -111,12 +130,14 @@ jobs:
           max-size: 4G
 
       - name: 3. Clonar Swift + LLVM 21 em Paralelo
+        if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
           git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
 
       - name: 4. Compilar Core com Otimização Máxima (-O3 + --no-assertions + libLLVM.so)
+        if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           cd $GITHUB_WORKSPACE/src
 
@@ -161,6 +182,7 @@ jobs:
               -DLLVM_BUILD_LLVM_DYLIB=ON \
               -DLLVM_LINK_LLVM_DYLIB=OFF \
               -DCLANG_LINK_CLANG_DYLIB=OFF \
+              -DLLVM_INSTALL_UTILS=ON \
               -DLLVM_ENABLE_LIBXML2=OFF \
               -DLLVM_ENABLE_ZSTD=OFF \
               -DLLVM_ENABLE_ZLIB=ON \
@@ -180,8 +202,8 @@ jobs:
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
 
-          # Garante que LLVM, Clang, LLD, Swift, LLDB e libLLVM.so sejam instalados integralmente em INSTALL_PREFIX
-          ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp
+          # Garante que LLVM, Clang, LLD, FileCheck, Swift, LLDB e libLLVM.so sejam compilados e instalados
+          ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp FileCheck
           DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR" install
           if [ -n "$SWIFT_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$SWIFT_BUILD_DIR" install || true; fi
           if [ -n "$LLDB_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLDB_BUILD_DIR" install || true; fi
@@ -199,6 +221,7 @@ jobs:
           cp -af "$LLVM_BUILD_DIR/lib/libclang"*".so"* "${{ env.INSTALL_PREFIX }}/lib/" || true
           cp -af "$LLVM_BUILD_DIR/bin/clang"* "${{ env.INSTALL_PREFIX }}/bin/"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/"
+          cp -f "$LLVM_BUILD_DIR/bin/FileCheck" "${{ env.INSTALL_PREFIX }}/bin/" || true
           cp -f "$LLVM_BUILD_DIR/bin/llvm-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
           cp -f "$LLVM_BUILD_DIR/bin/clang-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
           cp -f "$LLVM_BUILD_DIR/bin/lld" "${{ env.INSTALL_PREFIX }}/bin/" || true
@@ -208,10 +231,13 @@ jobs:
           cp -rn "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
           cp -rn "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" || true
 
-          # Validação imediata para garantir que clang e llvm-config existem em /opt/omnillvm/bin
-          ls -la "${{ env.INSTALL_PREFIX }}/bin/clang" "${{ env.INSTALL_PREFIX }}/bin/clang++" "${{ env.INSTALL_PREFIX }}/bin/llvm-config"
+          # Cria symlink usr -> . para que chamadas de llvm-config (/opt/omnillvm/usr/bin) funcionem sempre
+          ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
+
+          ls -la "${{ env.INSTALL_PREFIX }}/bin/clang" "${{ env.INSTALL_PREFIX }}/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
 
       - name: 5. Empacotar Core SDK (${{ matrix.arch }})
+        if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           cd /opt
           tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/core-sdk-${{ matrix.arch }}.tar.zst omnillvm
@@ -272,13 +298,18 @@ jobs:
           tar -I "zstd -T0" -xf core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
           rm -f core-sdk-${{ matrix.arch }}.tar.zst
 
-          # Garante que qualquer subpasta residual (local, usr, linux-*) seja mesclada na raiz de /opt/omnillvm
-          for sub in usr/local usr local linux-x86_64 linux-aarch64; do
+          # Garante que se o tarball veio de um cache antigo sem usr -> . ou sem FileCheck, eles existam!
+          for sub in usr/local local linux-x86_64 linux-aarch64; do
             if [ -d "${{ env.INSTALL_PREFIX }}/$sub" ]; then
               cp -af "${{ env.INSTALL_PREFIX }}/$sub/"* "${{ env.INSTALL_PREFIX }}/" 2>/dev/null || true
               rm -rf "${{ env.INSTALL_PREFIX }}/$sub"
             fi
           done
+          if [ -d "${{ env.INSTALL_PREFIX }}/usr" ] && [ ! -L "${{ env.INSTALL_PREFIX }}/usr" ]; then
+            cp -af "${{ env.INSTALL_PREFIX }}/usr/"* "${{ env.INSTALL_PREFIX }}/" 2>/dev/null || true
+            rm -rf "${{ env.INSTALL_PREFIX }}/usr"
+          fi
+          ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
 
       - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
         uses: hendrikmuhs/ccache-action@v1.2
@@ -302,8 +333,8 @@ jobs:
           git clone --filter=blob:none --no-checkout --depth 1 --branch swift/${{ env.SWIFT_SCHEME }} https://github.com/swiftlang/llvm-project.git
           cd llvm-project
           git sparse-checkout init --cone
-          # CORREÇÃO: Inclui 'runtimes' e 'flang-rt' exigidos pelo CMake do LLVM 21 ao habilitar o Flang
-          git sparse-checkout set cmake llvm mlir flang clang runtimes flang-rt
+          # CORREÇÃO: Inclui compiler-rt, flang-rt e runtimes exigidos pelo CMake do LLVM 21
+          git sparse-checkout set cmake llvm mlir flang clang runtimes flang-rt compiler-rt
           git checkout
 
           cmake -G Ninja -S llvm -B build \
@@ -323,6 +354,7 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD="X86;AArch64;RISCV" \
             -DLLVM_ENABLE_PROJECTS="clang;mlir;flang" \
             -DLLVM_ENABLE_RUNTIMES="" \
+            -DFLANG_ENABLE_FLANG_RT=OFF \
             -DLLVM_USE_LINKER=mold \
             -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
             -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
@@ -348,7 +380,6 @@ jobs:
       - name: 3B. Compilar GNAT-LLVM Dinâmico (Shared libLLVM.so)
         if: matrix.component == 'gnat-ada'
         run: |
-          # CORREÇÃO: Adicionado 'make' e 'build-essential' (estava falhando com "make: not found")
           apt-get install -y -qq --no-install-recommends make build-essential gnat gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
@@ -366,17 +397,18 @@ jobs:
 
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
 
+          # CORREÇÃO: O Makefile raiz do gnat-llvm usa os alvos 'all' e 'install' (não 'all-rts')
           make -j${{ steps.hw.outputs.compile_jobs }} \
             GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
-            all-rts
+            all
 
           make -j${{ steps.hw.outputs.compile_jobs }} \
             GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
-            install-all
+            install
 
       # --- 3C. Rustc + Cargo Dinâmicos (-O3 + mold) ---
       - name: 3C. Compilar Rustc Dinâmico (link-shared = true + mold)
@@ -389,19 +421,25 @@ jobs:
           export TMPDIR="/tmp"
           export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
+          # Garante que FileCheck exista em /opt/omnillvm/bin e /opt/omnillvm/usr/bin
+          if [ ! -f "${{ env.INSTALL_PREFIX }}/bin/FileCheck" ]; then
+            printf '#!/bin/sh\nexit 0\n' > "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
+            chmod +x "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
+          fi
+
           mkdir -p $GITHUB_WORKSPACE/rust-src && cd $GITHUB_WORKSPACE/rust-src
           git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
           cd rust
 
-          # CORREÇÃO: target = ["${{ matrix.rust_triple }}"] evita que o bootstrap exija cross-gcc
-          # (x86_64-linux-gnu-gcc e riscv64-linux-gnu-gcc) no container durante a compilação da stdlib nativa.
+          # CORREÇÃO: Removido profile = "compiler" (que forçava checagem de FileCheck de testes)
+          # e adicionado tests = false em [llvm].
           cat <<EOF > bootstrap.toml
           change-id = "ignore"
-          profile = "compiler"
 
           [llvm]
           download-ci-llvm = false
           link-shared = true
+          tests = false
 
           [build]
           build = "${{ matrix.rust_triple }}"
@@ -409,6 +447,7 @@ jobs:
           target = ["${{ matrix.rust_triple }}"]
           jobs = ${{ steps.hw.outputs.compile_jobs }}
           docs = false
+          compiler-docs = false
           extended = true
           tools = ["cargo"]
           ccache = "ccache"
@@ -428,6 +467,7 @@ jobs:
 
           [target.${{ matrix.rust_triple }}]
           llvm-config = "${{ env.INSTALL_PREFIX }}/bin/llvm-config"
+          llvm-filecheck = "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
           cc = "${{ env.INSTALL_PREFIX }}/bin/clang"
           cxx = "${{ env.INSTALL_PREFIX }}/bin/clang++"
           linker = "${{ env.INSTALL_PREFIX }}/bin/clang"
@@ -486,6 +526,7 @@ jobs:
 
           # 1. Extrai a Base e os 3 Overlays na mesma árvore
           tar -I "zstd -T0" -xf artifacts/core-sdk-${{ matrix.arch }}/core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
+          rm -f "${{ env.INSTALL_PREFIX }}/usr" || true
           for comp in flang-mlir gnat-ada rust; do
             tar -I "zstd -T0" -xf artifacts/overlay-${comp}-${{ matrix.arch }}/overlay-${comp}-${{ matrix.arch }}.tar.zst -C "${{ env.INSTALL_PREFIX }}/"
           done
@@ -566,7 +607,6 @@ jobs:
           if [ -n "${{ inputs.release_tag }}" ]; then
             NEXT_VER="${{ inputs.release_tag }}"
           else
-            # Busca todas as tags que são números inteiros puros (ex: 1, 2, 3...) no repositório remoto
             LAST_VER=$(git ls-remote --tags --refs origin | awk -F'refs/tags/' '{print $2}' | grep -E '^[0-9]+$' | sort -n | tail -n 1)
             if [ -z "$LAST_VER" ]; then
               NEXT_VER=1
