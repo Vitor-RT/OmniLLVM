@@ -127,11 +127,10 @@ jobs:
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export TMPDIR="/tmp"
 
-          # Nota crucial sobre LLVM_BUILD_LLVM_DYLIB vs LLVM_LINK_LLVM_DYLIB no Swift:
-          # - Mantemos -DLLVM_BUILD_LLVM_DYLIB=ON para construir a libLLVM.so.21.0 compartilhada (para Flang, Ada e Rust).
-          # - NÃO ativamos LLVM_LINK_LLVM_DYLIB=ON nem CLANG_LINK_CLANG_DYLIB=ON aqui porque o CMake do Swift
-          #   linka libLLVMPasses.a estaticamente dentro de lib_InternalSwiftScan.so; se libclang-cpp.so puxar
-          #   libLLVM.so ao mesmo tempo, ocorre crash por duplo registro de opções ('CommandLineParser::addOption').
+          # Nota crucial:
+          # - -DLLVM_BUILD_LLVM_DYLIB=ON constrói a libLLVM.so.21.0 compartilhada (para Flang, Ada e Rust).
+          # - -DLLVM_LINK_LLVM_DYLIB=OFF evita colisão estática+dinâmica no lib_InternalSwiftScan.so.
+          # - -DLLDB_INCLUDE_TESTS=OFF impede que o build standalone do LLDB procure o target 'runtimes' em lldb/test.
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN"
 
           ./swift/utils/build-script \
@@ -168,6 +167,7 @@ jobs:
               -DLLVM_ENABLE_LIBXML2=OFF \
               -DLLVM_ENABLE_ZSTD=OFF \
               -DLLVM_ENABLE_ZLIB=ON \
+              -DLLDB_INCLUDE_TESTS=OFF \
               -DLLDB_ENABLE_SWIG=OFF \
               -DLLDB_ENABLE_PYTHON=OFF \
               -DLLDB_ENABLE_LUA=OFF \
@@ -185,11 +185,12 @@ jobs:
           fi
 
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
-          # Garante que a libLLVM.so.21.0 seja construída e copiada para o SDK (mesmo que o --llvm-install-components do Swift a omita)
-          ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM
+          # Garante que a libLLVM.so.21.0 e a libclang-cpp.so.21.0 sejam construídas e copiadas para o SDK
+          ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp
 
           mkdir -p "${{ env.INSTALL_PREFIX }}/bin" "${{ env.INSTALL_PREFIX }}/include" "${{ env.INSTALL_PREFIX }}/lib"
           cp -af "$LLVM_BUILD_DIR/lib/libLLVM"*".so"* "${{ env.INSTALL_PREFIX }}/lib/"
+          cp -af "$LLVM_BUILD_DIR/lib/libclang"*".so"* "${{ env.INSTALL_PREFIX }}/lib/" || true
           cp -f "$LLVM_BUILD_DIR/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
           cp -f "$LLVM_BUILD_DIR/bin/clang-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
