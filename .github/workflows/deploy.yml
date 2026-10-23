@@ -18,6 +18,14 @@ on:
         options:
           - 'false'
           - 'true'
+      rebuild_frontends:
+        description: 'Forçar recompilação do Stage 2 (Flang/Ada/Rust)? (false = usa cache)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: write
@@ -27,8 +35,9 @@ env:
   SWIFT_SCHEME: release/6.3
   SWIFT_BOOTSTRAP_VER: 6.0.3
   RUST_BRANCH: 1.91.0
-  # Mude este número (v1 -> v2) se quiser invalidar o cache do Stage 1 em um push normal
+  # Mude estes números se quiser invalidar o cache de algum estágio via git push
   CORE_CACHE_REV: v2
+  FRONTEND_CACHE_REV: v2
   DEBIAN_FRONTEND: noninteractive
   # Otimização MÁXIMA para o binário final (-O3 -fno-plt) + I/O em RAM (-pipe) + zero peso morto (-g0 -DNDEBUG)
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
@@ -69,7 +78,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # FAST-SKIP: Se o Core SDK já foi compilado antes, restaura em ~20 segundos e pula tudo!
+      # FAST-SKIP STAGE 1: Se o Core SDK já foi compilado antes, restaura em ~20s e pula tudo!
       - name: 0. Cache do Core SDK Pronto (Pula os 26 min de build se existir!)
         id: core-cache
         if: inputs.rebuild_core != 'true'
@@ -89,16 +98,13 @@ jobs:
             libxml2-dev uuid-dev libicu-dev libsqlite3-dev \
             libcurl4-openssl-dev libblocksruntime-dev zlib1g-dev zstd xz-utils file procps
 
-          # Garante fisicamente que nenhum header dev do Python ou SWIG exista no container Ubuntu 26.04
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
 
-          # Substitui o ld.bfd lento pelo ld.lld multi-thread como linker padrão de todo o sistema
           ln -sf /usr/bin/ld.lld /usr/bin/ld
           ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
           ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
 
-          # Baixa o Swift pré-compilado APENAS para fornecer o swiftc de bootstrap
           SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2404${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu24.04${{ matrix.swift_dir_arch }}.tar.gz"
           mkdir -p /opt/swift-bootstrap
           curl -fsSL "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
@@ -202,13 +208,11 @@ jobs:
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
 
-          # Garante que LLVM, Clang, LLD, FileCheck, Swift, LLDB e libLLVM.so sejam compilados e instalados
           ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp FileCheck
           DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR" install
           if [ -n "$SWIFT_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$SWIFT_BUILD_DIR" install || true; fi
           if [ -n "$LLDB_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLDB_BUILD_DIR" install || true; fi
 
-          # Achata qualquer subdiretório usr/local ou local ou linux-* criado pelo DESTDIR
           for sub in usr/local usr local linux-x86_64 linux-aarch64; do
             if [ -d "${{ env.INSTALL_PREFIX }}/$sub" ]; then
               cp -af "${{ env.INSTALL_PREFIX }}/$sub/"* "${{ env.INSTALL_PREFIX }}/" 2>/dev/null || true
@@ -231,9 +235,7 @@ jobs:
           cp -rn "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
           cp -rn "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" || true
 
-          # Cria symlink usr -> . para que chamadas de llvm-config (/opt/omnillvm/usr/bin) funcionem sempre
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
-
           ls -la "${{ env.INSTALL_PREFIX }}/bin/clang" "${{ env.INSTALL_PREFIX }}/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
 
       - name: 5. Empacotar Core SDK (${{ matrix.arch }})
@@ -252,6 +254,7 @@ jobs:
 
   # ============================================================================
   # ESTÁGIO 2: Matrix 3x2 em Container Ubuntu 26.04 (Flang, Ada e Rust)
+  # Agora CADA componente também salva seu overlay .tar.zst pronto em cache!
   # ============================================================================
   build-parallel-frontends:
     name: "Stage 2: ${{ matrix.component }} [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -277,13 +280,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # FAST-SKIP STAGE 2: Se este componente (ex: flang, ada ou rust) já compilou com sucesso antes,
+      # restaura o overlay pronto em ~10 segundos e pula a compilação!
+      - name: 0. Cache do Overlay Pronto (${{ matrix.component }}-${{ matrix.arch }})
+        id: overlay-cache
+        if: inputs.rebuild_frontends != 'true'
+        uses: actions/cache@v4
+        with:
+          path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
+          key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
+
       - name: 1. Baixar Core SDK (${{ matrix.arch }})
+        if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           name: core-sdk-${{ matrix.arch }}
 
       - name: Extrair Core SDK e Configurar CPUs/RAM no Ubuntu 26.04
         id: hw
+        if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends ca-certificates curl git zstd xz-utils procps
@@ -298,7 +313,6 @@ jobs:
           tar -I "zstd -T0" -xf core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
           rm -f core-sdk-${{ matrix.arch }}.tar.zst
 
-          # Garante que se o tarball veio de um cache antigo sem usr -> . ou sem FileCheck, eles existam!
           for sub in usr/local local linux-x86_64 linux-aarch64; do
             if [ -d "${{ env.INSTALL_PREFIX }}/$sub" ]; then
               cp -af "${{ env.INSTALL_PREFIX }}/$sub/"* "${{ env.INSTALL_PREFIX }}/" 2>/dev/null || true
@@ -312,6 +326,7 @@ jobs:
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
 
       - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
+        if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
@@ -321,7 +336,7 @@ jobs:
 
       # --- 3A. Flang + MLIR Dinâmicos (-O3 + mold) ---
       - name: 3A. Compilar Flang + MLIR Dinâmicos (-O3)
-        if: matrix.component == 'flang-mlir'
+        if: matrix.component == 'flang-mlir' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends cmake ninja-build make clang lld mold ccache python3 zlib1g-dev
 
@@ -333,8 +348,8 @@ jobs:
           git clone --filter=blob:none --no-checkout --depth 1 --branch swift/${{ env.SWIFT_SCHEME }} https://github.com/swiftlang/llvm-project.git
           cd llvm-project
           git sparse-checkout init --cone
-          # CORREÇÃO: Inclui compiler-rt, flang-rt e runtimes exigidos pelo CMake do LLVM 21
-          git sparse-checkout set cmake llvm mlir flang clang runtimes flang-rt compiler-rt
+          # CORREÇÃO: Adicionado 'third-party' (contém siphash/SipHash.h exigido pelo LLVMSupport no LLVM 21)
+          git sparse-checkout set cmake llvm mlir flang clang third-party runtimes flang-rt compiler-rt
           git checkout
 
           cmake -G Ninja -S llvm -B build \
@@ -378,9 +393,17 @@ jobs:
 
       # --- 3B. GNAT-LLVM (Ada) Dinâmico (-O3 + Multi-core total) ---
       - name: 3B. Compilar GNAT-LLVM Dinâmico (Shared libLLVM.so)
-        if: matrix.component == 'gnat-ada'
+        if: matrix.component == 'gnat-ada' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends make build-essential gnat gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
+          apt-get install -y -qq --no-install-recommends make build-essential gnat-14 g++-14 gcc-14 gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
+
+          # CORREÇÃO: Alinha gcc/g++ com a exata versão do gnat-14 para evitar conflito C23 (GCC 15) vs GNAT 14 em link.c
+          ln -sf /usr/bin/gcc-14 /usr/bin/gcc
+          ln -sf /usr/bin/g++-14 /usr/bin/g++
+          ln -sf /usr/bin/gnat-14 /usr/bin/gnat
+          ln -sf /usr/bin/gnatmake-14 /usr/bin/gnatmake
+          ln -sf /usr/bin/gnatbind-14 /usr/bin/gnatbind
+          ln -sf /usr/bin/gnatlink-14 /usr/bin/gnatlink
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
@@ -391,20 +414,21 @@ jobs:
           cd gnat-llvm
           git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
 
+          # Inclui gcc/ada e include do GCC para que link.c tenha todos os cabeçalhos (ansidecl.h, system.h, etc.)
           git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
-          cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada && git checkout && cd ../..
+          cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
 
-          # CORREÇÃO: O Makefile raiz do gnat-llvm usa os alvos 'all' e 'install' (não 'all-rts')
-          make -j${{ steps.hw.outputs.compile_jobs }} \
-            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
+          # Força gprconfig a usar gcc-14 + gnat-14 consistentemente e mostra qualquer erro real (-v)
+          make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
+            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -v" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
-            all
+            build
 
-          make -j${{ steps.hw.outputs.compile_jobs }} \
+          make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
             GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
@@ -412,7 +436,7 @@ jobs:
 
       # --- 3C. Rustc + Cargo Dinâmicos (-O3 + mold) ---
       - name: 3C. Compilar Rustc Dinâmico (link-shared = true + mold)
-        if: matrix.component == 'rust'
+        if: matrix.component == 'rust' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends make build-essential cmake ninja-build clang mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
 
@@ -421,7 +445,6 @@ jobs:
           export TMPDIR="/tmp"
           export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
-          # Garante que FileCheck exista em /opt/omnillvm/bin e /opt/omnillvm/usr/bin
           if [ ! -f "${{ env.INSTALL_PREFIX }}/bin/FileCheck" ]; then
             printf '#!/bin/sh\nexit 0\n' > "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
             chmod +x "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
@@ -431,8 +454,13 @@ jobs:
           git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
           cd rust
 
-          # CORREÇÃO: Removido profile = "compiler" (que forçava checagem de FileCheck de testes)
-          # e adicionado tests = false em [llvm].
+          # CORREÇÃO: Adapta PassWrapper.cpp do Rust 1.91 para a assinatura de PGOOptions do LLVM 21 (Swift 6.3),
+          # onde o parâmetro 'FS' (FileSystem) não existe no construtor de PGOOptions.h
+          if ! grep -q "FileSystem" "${{ env.INSTALL_PREFIX }}/include/llvm/Support/PGOOptions.h"; then
+            echo "Aplicando patch de compatibilidade PGOOptions (LLVM 21 Swift) em PassWrapper.cpp..."
+            sed -i 's/"", "", "", FS,/"", "", "",/g' compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+          fi
+
           cat <<EOF > bootstrap.toml
           change-id = "ignore"
 
@@ -477,6 +505,7 @@ jobs:
           python3 ./x.py install
 
       - name: 4. Empacotar Overlay (${{ matrix.component }}-${{ matrix.arch }})
+        if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           cd /opt/overlay-install
           tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst .
