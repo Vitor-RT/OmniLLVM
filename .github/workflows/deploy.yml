@@ -18,6 +18,7 @@ permissions:
 env:
   INSTALL_PREFIX: /opt/omnillvm
   SWIFT_SCHEME: release/6.3
+  SWIFT_BOOTSTRAP_VER: 6.0.3
   RUST_BRANCH: 1.91.0
   DEBIAN_FRONTEND: noninteractive
   HOST_FAST_FLAGS: "-O2 -pipe -fno-plt -g0 -DNDEBUG -Wl,-rpath,\\$ORIGIN/../lib:\\$ORIGIN"
@@ -39,11 +40,15 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-26.04
+            swift_url_arch: ""
+            swift_dir_arch: ""
           - arch: arm64
             runner: ubuntu-26.04-arm
+            swift_url_arch: "-aarch64"
+            swift_dir_arch: "-aarch64"
 
     steps:
-      - name: 1. Instalar Dependências no Ubuntu 26.04 e Tuning de RAM
+      - name: 1. Instalar Dependências, Swift Host Bootstrap e Tuning de RAM
         id: hw
         run: |
           apt-get update -qq
@@ -56,6 +61,12 @@ jobs:
           # Garante fisicamente que nenhum header dev do Python exista no container Ubuntu 26.04
           apt-get remove -y libpython3*-dev || true
           mkdir -p ${{ env.INSTALL_PREFIX }}
+
+          # Baixa um compilador Swift pré-compilado apenas para o bootstrap (exigido pelo Swift 6.3 --bootstrapping=hosttools)
+          SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2404${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu24.04${{ matrix.swift_dir_arch }}.tar.gz"
+          mkdir -p /opt/swift-bootstrap
+          curl -fsSL "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
+          echo "/opt/swift-bootstrap/bin" >> $GITHUB_PATH
 
           CORES=$(nproc --all)
           RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
@@ -89,7 +100,7 @@ jobs:
             --release \
             --assertions \
             --no-swift-stdlib-assertions \
-            --bootstrapping=off \
+            --bootstrapping=hosttools \
             --lldb \
             --jobs ${{ steps.hw.outputs.cores }} \
             --install-all \
@@ -122,6 +133,9 @@ jobs:
               -DCLANG_INCLUDE_TESTS=OFF \
               -DLLDB_INCLUDE_TESTS=OFF \
               -DLLVM_ENABLE_BINDINGS=OFF"
+
+          # Remove o compilador de bootstrap temporário para não ocupar espaço
+          rm -rf /opt/swift-bootstrap
 
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
           mkdir -p "${{ env.INSTALL_PREFIX }}/bin" "${{ env.INSTALL_PREFIX }}/include" "${{ env.INSTALL_PREFIX }}/lib"
