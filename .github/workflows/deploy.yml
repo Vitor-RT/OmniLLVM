@@ -31,7 +31,7 @@ env:
 
 jobs:
   # ============================================================================
-  # ESTÁGIO 1: Core Dinâmico em Container Ubuntu 26.04 (LLVM + Clang + LLDB + Swift)
+  # ESTÁGIO 1: Core em Container Ubuntu 26.04 (LLVM + Clang + LLDB + Swift)
   # ============================================================================
   build-core:
     name: "Stage 1: Core LLVM+Swift [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -116,7 +116,7 @@ jobs:
           git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
 
-      - name: 4. Compilar Core 100% Dinâmico com Otimização Máxima (-O3 + --no-assertions)
+      - name: 4. Compilar Core com Otimização Máxima (-O3 + --no-assertions + libLLVM.so)
         run: |
           cd $GITHUB_WORKSPACE/src
 
@@ -127,18 +127,12 @@ jobs:
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export TMPDIR="/tmp"
 
-          # Prepara o diretório de lib do LLVM e cria symlink em /opt/swift-bootstrap/lib/swift/linux
-          # (pois o CMake do Swift força LD_LIBRARY_PATH=/opt/swift-bootstrap/lib/swift/linux ao compilar Swift.o!)
-          LLVM_LIB_BUILD="$GITHUB_WORKSPACE/src/build/Ninja-Release/${{ matrix.llvm_build_subdir }}/lib"
-          mkdir -p "$LLVM_LIB_BUILD"
-          for so in libLLVM.so libLLVM.so.21.0 libLLVM-21.so libclang-cpp.so libclang-cpp.so.21.0 libclang.so libclang.so.21.0 libLTO.so libLTO.so.21.0 libRemarks.so libRemarks.so.21.0; do
-            ln -sf "$LLVM_LIB_BUILD/$so" "/opt/swift-bootstrap/lib/swift/linux/$so"
-            ln -sf "$LLVM_LIB_BUILD/$so" "/usr/lib/$so"
-          done
-
-          # Inclui também $ORIGIN/../../llvm-linux-*/lib no RPATH de compilação para que swift-frontend e libSwiftScan
-          # sempre achem libLLVM.so.21.0 diretamente na árvore de build antes mesmo da instalação!
-          BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN:\$ORIGIN/../../${{ matrix.llvm_build_subdir }}/lib"
+          # Nota crucial sobre LLVM_BUILD_LLVM_DYLIB vs LLVM_LINK_LLVM_DYLIB no Swift:
+          # - Mantemos -DLLVM_BUILD_LLVM_DYLIB=ON para construir a libLLVM.so.21.0 compartilhada (para Flang, Ada e Rust).
+          # - NÃO ativamos LLVM_LINK_LLVM_DYLIB=ON nem CLANG_LINK_CLANG_DYLIB=ON aqui porque o CMake do Swift
+          #   linka libLLVMPasses.a estaticamente dentro de lib_InternalSwiftScan.so; se libclang-cpp.so puxar
+          #   libLLVM.so ao mesmo tempo, ocorre crash por duplo registro de opções ('CommandLineParser::addOption').
+          BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN"
 
           ./swift/utils/build-script \
             --release \
@@ -169,8 +163,8 @@ jobs:
               -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
               -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
               -DLLVM_BUILD_LLVM_DYLIB=ON \
-              -DLLVM_LINK_LLVM_DYLIB=ON \
-              -DCLANG_LINK_CLANG_DYLIB=ON \
+              -DLLVM_LINK_LLVM_DYLIB=OFF \
+              -DCLANG_LINK_CLANG_DYLIB=OFF \
               -DLLVM_ENABLE_LIBXML2=OFF \
               -DLLVM_ENABLE_ZSTD=OFF \
               -DLLVM_ENABLE_ZLIB=ON \
@@ -191,7 +185,11 @@ jobs:
           fi
 
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
+          # Garante que a libLLVM.so.21.0 seja construída e copiada para o SDK (mesmo que o --llvm-install-components do Swift a omita)
+          ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM
+
           mkdir -p "${{ env.INSTALL_PREFIX }}/bin" "${{ env.INSTALL_PREFIX }}/include" "${{ env.INSTALL_PREFIX }}/lib"
+          cp -af "$LLVM_BUILD_DIR/lib/libLLVM"*".so"* "${{ env.INSTALL_PREFIX }}/lib/"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
           cp -f "$LLVM_BUILD_DIR/bin/clang-tblgen" "${{ env.INSTALL_PREFIX }}/bin/" || true
@@ -552,7 +550,7 @@ jobs:
             fi
           fi
 
-          echo " Publicando Release Versão: $NEXT_VER"
+          echo "🚀 Publicando Release Versão: $NEXT_VER"
           echo "tag=$NEXT_VER" >> $GITHUB_OUTPUT
 
           sha256sum omnillvm-toolchain-ubuntu26.04-*.tar.zst > SHA256SUMS.txt
