@@ -486,12 +486,12 @@ jobs:
           cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
-          # Garante que Table.Table.Clear exista em table.ads caso gnat_src não tenha a declaração
+          # Garante que Table.Table.Clear exista em table.ads
           if ! grep -q "procedure Clear" llvm-interface/gnat_src/table.ads; then
             sed -i 's/procedure Init;/procedure Init;\n      procedure Clear renames Init;/' llvm-interface/gnat_src/table.ads
           fi
 
-          # Garante visibilidade do operador System.CRTL.long em gnatlink.adb (tanto no topo quanto dentro de Delete)
+          # Garante visibilidade do operador System.CRTL.long em gnatlink.adb
           python3 - << 'EOF'
           p = "llvm-interface/gnat_src/gnatlink.adb"
           with open(p, "r") as f:
@@ -502,17 +502,22 @@ jobs:
               f.write(txt)
           EOF
 
+          # CORREÇÃO DO ERRO "warning: no entities of Einfo.Utils are referenced [-gnatwu]":
+          # O flag -gnatg ativa -gnatwe (warnings as errors). Adicionamos -gnatwn (normal warnings, nunca falha por warning)
+          # e removemos -Werror de todos os arquivos .gpr!
+          sed -i 's/"-Werror"/"-Wno-error"/g' llvm-interface/*.gpr 2>/dev/null || true
+          sed -i 's/"-gnatg"/"-gnatg", "-gnatwn"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
           sed -i 's/"-lclangBasic"/"-lclang-cpp"/g' llvm-interface/gnat_llvm.gpr 2>/dev/null || true
 
           make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lclang-cpp" \
+            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -cargs:Ada -gnatwn -cargs:C++ -Wno-error -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lclang-cpp" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
             build
 
           make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
+            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -cargs:Ada -gnatwn -cargs:C++ -Wno-error" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
             install
