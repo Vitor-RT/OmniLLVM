@@ -50,10 +50,10 @@ env:
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
-  # Mantidos os caches de compilação do Stage 1 e Stage 2 (pula direto para o Stage 3!)
-  CORE_CACHE_REV: v1-swift641
-  FRONTEND_CACHE_REV: v1-swift641-r194-g271
-  PACKAGE_CACHE_REV: v10-libdispatch-apt
+  # Chaves de Cache permanentes para a arquitetura limpa v2-clean
+  CORE_CACHE_REV: v2-clean-swift641
+  FRONTEND_CACHE_REV: v2-clean-r194-g271
+  PACKAGE_CACHE_REV: v2-clean-pkg
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -65,6 +65,7 @@ env:
 jobs:
   # ============================================================================
   # ESTÁGIO 1: Core em Container Ubuntu 26.04 (AMD64 + ARM64)
+  # Compila LLVM 21 + Clang + LLD + LLDB + Swift 6.4.1 + libdispatch Nativo
   # ============================================================================
   build-core:
     name: "Stage 1: Core LLVM+Swift 6.4.1 [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -116,7 +117,7 @@ jobs:
             git cmake ninja-build make clang lld mold ccache patchelf curl \
             python3 pkg-config libncurses-dev libedit-dev \
             libxml2-dev uuid-dev libicu-dev libsqlite3-dev \
-            libcurl4-openssl-dev libblocksruntime-dev libdispatch-dev zlib1g-dev xz-utils file procps
+            libcurl4-openssl-dev libblocksruntime-dev zlib1g-dev xz-utils file procps
 
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
@@ -156,14 +157,14 @@ jobs:
             omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
 
-      - name: 3. Clonar Swift 6.4.1 + LLVM 21 (release/6.4.1) em Paralelo
+      - name: 3. Clonar Swift 6.4.1 + LLVM 21 + libdispatch (release/6.4.1) em Paralelo
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
           git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
 
-      - name: 4. Compilar Core 6.4.1 com Otimização Máxima (-O3 + --no-assertions + libLLVM.so Nativa)
+      - name: 4. Compilar Core 6.4.1 Enxuto (-O3 + libLLVM.so + libdispatch Nativo + Sem swift_static)
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           cd $GITHUB_WORKSPACE/src
@@ -175,8 +176,9 @@ jobs:
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export TMPDIR="/tmp"
 
-          BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN"
+          BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN/../lib/swift/linux:\$ORIGIN"
 
+          # Ativa LinkDyLib = true nativamente no código-fonte C++ do llvm-config
           sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
             $GITHUB_WORKSPACE/src/llvm-project/llvm/tools/llvm-config/llvm-config.cpp
 
@@ -187,6 +189,7 @@ jobs:
             --bootstrapping=hosttools \
             --host-cc=/usr/bin/clang \
             --host-cxx=/usr/bin/clang++ \
+            --libdispatch \
             --lldb \
             --jobs ${{ steps.hw.outputs.compile_jobs }} \
             --install-all \
@@ -206,6 +209,16 @@ jobs:
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
               -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld' \
               -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind' \
+              -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+              -DCOMPILER_RT_BUILD_XRAY=OFF \
+              -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+              -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+              -DCOMPILER_RT_BUILD_PROFILE=OFF \
+              -DLIBCXX_ENABLE_STATIC=OFF \
+              -DLIBCXXABI_ENABLE_STATIC=OFF \
+              -DLIBUNWIND_ENABLE_STATIC=OFF \
+              -DSWIFT_BUILD_STATIC_STDLIB=OFF \
+              -DSWIFT_BUILD_STATIC_SDK_OVERLAY=OFF \
               -DLLVM_USE_LINKER=lld \
               -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
               -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
@@ -229,12 +242,14 @@ jobs:
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
+          DISPATCH_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "libdispatch-linux-*" | head -n 1)
 
           sed -i 's/#define LLVM_ENABLE_DYLIB 0/#define LLVM_ENABLE_DYLIB 1/g' \
             "$LLVM_BUILD_DIR/tools/llvm-config/BuildVariables.inc" || true
 
           ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp FileCheck llvm-config
           DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR" install
+          if [ -n "$DISPATCH_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$DISPATCH_BUILD_DIR" install || true; fi
           if [ -n "$SWIFT_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$SWIFT_BUILD_DIR" install || true; fi
           if [ -n "$LLDB_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLDB_BUILD_DIR" install || true; fi
 
@@ -261,6 +276,14 @@ jobs:
           cp -ru "$LLVM_BUILD_DIR/include/"* "${{ env.INSTALL_PREFIX }}/include/" 2>/dev/null || true
           cp -ru "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" 2>/dev/null || true
           cp -ru "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" 2>/dev/null || true
+
+          # Garante que todas as .so compiladas em lib/swift (incluindo libdispatch.so e lib_CompilerSwift*.so)
+          # tenham symlink direto em /opt/omnillvm/lib/
+          find "${{ env.INSTALL_PREFIX }}/lib/swift" -name "*.so*" 2>/dev/null | while read -r f; do
+            if [ ! -e "${{ env.INSTALL_PREFIX }}/lib/$(basename "$f")" ]; then
+              ln -sf "$f" "${{ env.INSTALL_PREFIX }}/lib/$(basename "$f")" 2>/dev/null || true
+            fi
+          done
 
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
 
@@ -308,9 +331,11 @@ jobs:
           - arch: amd64
             runner: ubuntu-26.04
             rust_triple: x86_64-unknown-linux-gnu
+            gnu_triple: x86_64-linux-gnu
           - arch: arm64
             runner: ubuntu-26.04-arm
             rust_triple: aarch64-unknown-linux-gnu
+            gnu_triple: aarch64-linux-gnu
 
     steps:
       - name: 0A. Preparar ZSTD para o Cache do GitHub no Ubuntu 26.04
@@ -353,18 +378,7 @@ jobs:
           tar -I "zstd -T0" -xf core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
           rm -f core-sdk-${{ matrix.arch }}.tar.zst
 
-          for sub in usr/local local linux-x86_64 linux-aarch64; do
-            if [ -d "${{ env.INSTALL_PREFIX }}/$sub" ]; then
-              cp -af "${{ env.INSTALL_PREFIX }}/$sub/"* "${{ env.INSTALL_PREFIX }}/" 2>/dev/null || true
-              rm -rf "${{ env.INSTALL_PREFIX }}/$sub"
-            fi
-          done
-          if [ -d "${{ env.INSTALL_PREFIX }}/usr" ] && [ ! -L "${{ env.INSTALL_PREFIX }}/usr" ]; then
-            cp -af "${{ env.INSTALL_PREFIX }}/usr/"* "${{ env.INSTALL_PREFIX }}/" 2>/dev/null || true
-            rm -rf "${{ env.INSTALL_PREFIX }}/usr"
-          fi
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
-
           "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
 
       - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
@@ -432,6 +446,7 @@ jobs:
           cp -a build/lib/libFortran* "/opt/overlay-install/lib/" 2>/dev/null || true
           cp -a build/lib/libMLIR* "/opt/overlay-install/lib/" 2>/dev/null || true
           cp -a build/lib/libflang* "/opt/overlay-install/lib/" 2>/dev/null || true
+          rm -f /opt/overlay-install/lib/*.a
 
       # --- 3B. GNAT-LLVM (Ada) [release/27.1 Fixo Estável para LLVM 21] ---
       - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico (Shared libLLVM.so)
@@ -510,15 +525,18 @@ jobs:
             PREFIX="/opt/overlay-install" \
             build
 
-          mkdir -p /opt/overlay-install/bin /opt/overlay-install/lib
+          # Instala binários e apenas os arquivos .ali/.ads/.adb leves da rts-native,
+          # apontando as .so para a libgnat-15 do APT (Zero arquivos .a pesados no overlay!)
+          mkdir -p /opt/overlay-install/bin /opt/overlay-install/lib/rts-native/adalib /opt/overlay-install/lib/rts-native/adainclude
           cp -af llvm-interface/bin/* /opt/overlay-install/bin/
           ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
           ADA_INC_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adainclude/system.ads))
-          mkdir -p /opt/overlay-install/lib/rts-native/adalib /opt/overlay-install/lib/rts-native/adainclude
-          cp -af "$ADA_LIB_DIR/"* /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
+          cp -af "$ADA_LIB_DIR/"*.ali /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
           cp -af "$ADA_INC_DIR/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
-          cp -af "$ADA_LIB_DIR/"libgnat*.so* /opt/overlay-install/lib/ 2>/dev/null || true
-          cp -af "$ADA_LIB_DIR/"libgnarl*.so* /opt/overlay-install/lib/ 2>/dev/null || true
+          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat.so
+          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat-${GNAT_VER}.so
+          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnarl.so
+          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnarl-${GNAT_VER}.so
           ls -la /opt/overlay-install/bin/
 
       # --- 3C. Rustc 1.94.0 + Cargo Dinâmicos (-O3 + mold + LLVM 21) ---
@@ -582,6 +600,7 @@ jobs:
 
           python3 ./x.py build --stage 1 -j ${{ steps.hw.outputs.compile_jobs }}
           python3 ./x.py install
+          rm -rf /opt/overlay-install/share/doc /opt/overlay-install/share/man
 
       - name: 4. Empacotar Overlay (${{ matrix.component }}-${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
@@ -670,30 +689,13 @@ jobs:
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
           STRIP="$TOOLCHAIN/bin/llvm-strip"
 
-          # 2. CORTE MASSIVO DE PESO MORTO E DELEGAÇÃO DE LIBS DO SISTEMA OPERACIONAL PARA O APT:
-          # Remove pastas estáticas duplicadas (swift_static ~400MB, docs/manpages ~80MB)
-          # e remove todas as .so do SO que vêm pelo APT do Ubuntu 26.04 (libgnat-15, libedit, ncurses, etc.),
-          # PRESERVANDO 100% os runtimes compilados pelo nosso Swift-LLVM (libc++, libc++abi, libunwind, compiler-rt)!
+          # 2. Limpeza de qualquer documentação ou arquivo estático residual
           rm -rf "$TOOLCHAIN/lib/swift_static" \
                  "$TOOLCHAIN/share/doc" \
                  "$TOOLCHAIN/share/man" \
-                 "$TOOLCHAIN/share/info" \
-                 "$TOOLCHAIN/lib/rts-native/adalib/"*.a \
-                 "$TOOLCHAIN/lib/rts-native/adalib/"libgnat*.so* \
-                 "$TOOLCHAIN/lib/rts-native/adalib/"libgnarl*.so* \
-                 "$TOOLCHAIN/lib/"libgnat*.so* \
-                 "$TOOLCHAIN/lib/"libgnarl*.so* \
-                 "$TOOLCHAIN/lib/"libedit.so* \
-                 "$TOOLCHAIN/lib/"libncurses*.so* \
-                 "$TOOLCHAIN/lib/"libpanel*.so* \
-                 "$TOOLCHAIN/lib/"libform*.so* 2>/dev/null || true
+                 "$TOOLCHAIN/share/info" 2>/dev/null || true
 
-          # Aponta as libs dinâmicas do Ada (rts-native/adalib/libgnat.so e libgnarl.so) para a libgnat-15 do APT!
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat-15.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnarl.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnarl-15.so"
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
           fi
 
@@ -714,14 +716,11 @@ jobs:
             fi
           fi
 
-          # Expõe libc++.so, libc++abi.so e libunwind.so (compiladas pelo Swift-LLVM) diretamente em $TOOLCHAIN/lib
-          # e remove apenas as cópias .a estáticas redundantes delas
           find "$TOOLCHAIN/lib" -maxdepth 3 \( -name "libc++.so*" -o -name "libc++abi.so*" -o -name "libunwind.so*" \) | while read -r f; do
             if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ]; then
               ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
             fi
           done
-          find "$TOOLCHAIN/lib" -maxdepth 3 \( -name "libc++.a" -o -name "libc++abi.a" -o -name "libunwind.a" \) -delete 2>/dev/null || true
 
           if [ -e "$TOOLCHAIN/lib/libunwind.so" ] && [ ! -f "$TOOLCHAIN/lib/libgcc_s.so" ]; then
             echo "GROUP ( libunwind.so.1 -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
@@ -746,7 +745,7 @@ jobs:
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
 
-          # 4. Gera o script install-ubuntu26.04-deps.sh incluindo libdispatch-dev e libblocksruntime-dev!
+          # 4. Gera o script install-ubuntu26.04-deps.sh com pacotes 100% existentes no Ubuntu 26.04!
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
           set -euo pipefail
@@ -765,14 +764,14 @@ jobs:
             zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 \
             libicu78 libsqlite3-0 libcurl4t64 libxml2-16 \
             libssl3t64 libssl-dev \
-            libdispatch-dev libblocksruntime-dev libblocksruntime0 \
+            libblocksruntime0 libblocksruntime-dev \
             libgnat-15
           echo "✅ Todas as bibliotecas dinâmicas de sistema do Ubuntu 26.04 foram instaladas com sucesso!"
           EOF
           chmod +x "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
 
-          # 5. Cria symlinks em $TOOLCHAIN/lib para TODAS as bibliotecas .so dentro de $TOOLCHAIN/lib/swift/
-          find "$TOOLCHAIN/lib/swift" -type f -name "*.so*" 2>/dev/null | while read -r f; do
+          # 5. Garante symlinks em $TOOLCHAIN/lib para todas as bibliotecas .so dentro de $TOOLCHAIN/lib/swift/
+          find "$TOOLCHAIN/lib/swift" -name "*.so*" 2>/dev/null | while read -r f; do
             if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ] && [ ! -e "$TOOLCHAIN/lib/$(basename "$f")" ]; then
               ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
             fi
@@ -789,7 +788,6 @@ jobs:
           rdfind -makesymlinks true -makeresultsfile false "$TOOLCHAIN"
           symlinks -cr "$TOOLCHAIN"
 
-          # Garante que os symlinks externos para a libgnat-15 do Ubuntu permaneçam intactos após symlinks -cr
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat-15.so"
@@ -816,10 +814,11 @@ jobs:
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
 
           echo "===================================================================="
-          echo "🧹 REMOVENDO QUALQUER COMPILADOR GCC/G++/GNAT/LLVM DO CONTAINER"
+          echo "🧹 REMOVENDO COMPILADORES GCC/G++/GNAT/LLVM DO CONTAINER"
           echo "===================================================================="
-          apt-get purge -y gcc* g++* gnat* libgcc-*-dev libstdc++-*-dev llvm* clang* lld* lldb* || true
-          apt-get autoremove -y -qq || true
+          apt-get purge -y gcc g++ gnat gcc-14 g++-14 gnat-14 gcc-15 g++-15 gnat-15 \
+            libgcc-14-dev libgcc-15-dev libstdc++-14-dev libstdc++-15-dev \
+            clang clang-21 lld lld-21 lldb lldb-21 || true
 
           echo "===================================================================="
           echo "📦 EXECUTANDO O SCRIPT OFICIAL install-ubuntu26.04-deps.sh"
@@ -895,8 +894,8 @@ jobs:
           "$TOOLCHAIN/bin/rustc" -O -C linker="$TOOLCHAIN/bin/clang" -C link-arg=-L"$TOOLCHAIN/lib" test_rust_bin.rs -o test_rust_bin
           ./test_rust_bin
 
-          # [4/7] Teste Swift 6.4.1 (swiftc + libswiftCore.so + clang/lld)
-          echo "-> [4/7] Testando Swift 6.4.1 (swiftc + libswiftCore.so)..."
+          # [4/7] Teste Swift 6.4.1 (swiftc + libswiftCore.so + libdispatch.so + clang/lld)
+          echo "-> [4/7] Testando Swift 6.4.1 (swiftc + libswiftCore.so + libdispatch.so)..."
           cat << 'EOF' > test_swift.swift
           struct Point { var x: Int; var y: Int }
           let p = Point(x: 20, y: 22)
@@ -1008,7 +1007,7 @@ jobs:
             fi
           fi
 
-          # Gera o script standalone install-ubuntu26.04-deps.sh incluindo libdispatch-dev e libblocksruntime-dev
+          # Gera o script standalone install-ubuntu26.04-deps.sh
           cat << 'EOF' > install-ubuntu26.04-deps.sh
           #!/usr/bin/env bash
           set -euo pipefail
@@ -1027,7 +1026,7 @@ jobs:
             zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 \
             libicu78 libsqlite3-0 libcurl4t64 libxml2-16 \
             libssl3t64 libssl-dev \
-            libdispatch-dev libblocksruntime-dev libblocksruntime0 \
+            libblocksruntime0 libblocksruntime-dev \
             libgnat-15
           echo "✅ Dependências de sistema instaladas! Extraia o pacote em /opt/omnillvm e adicione /opt/omnillvm/bin ao PATH."
           EOF
@@ -1048,7 +1047,7 @@ jobs:
           name: "OmniLLVM Unified Toolchain - Release ${{ steps.meta.outputs.tag }} [Ubuntu 26.04 | AMD64 & ARM64]"
           body: |
             ### OmniLLVM Unified Toolchain — Ubuntu 26.04 LTS (`amd64` & `arm64`)
-            Toolchain **100% Pure Swift-LLVM** (Zero dependência de `gcc`, `libgcc-dev` ou `libstdc++-dev`), unificando `libLLVM.so` 21 (`swift/release/6.4.1`), `compiler-rt`, `libc++`, `libunwind` e `ld.lld` para **C, C++, Fortran (Flang), Ada (GNAT 27.1), Rust (1.94.0) e Swift (6.4.1)**.
+            Toolchain **100% Pure Swift-LLVM** (Zero dependência de `gcc`, `libgcc-dev` ou `libstdc++-dev`), unificando `libLLVM.so` 21 (`swift/release/6.4.1`), `compiler-rt`, `libc++`, `libunwind`, `libdispatch` e `ld.lld` para **C, C++, Fortran (Flang), Ada (GNAT 27.1), Rust (1.94.0) e Swift (6.4.1)**.
 
             #### 1. Instalar bibliotecas dinâmicas de sistema do Ubuntu 26.04 (Sem GCC):
             ```bash
