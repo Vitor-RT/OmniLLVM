@@ -40,12 +40,10 @@ permissions:
 
 env:
   INSTALL_PREFIX: /opt/omnillvm
-  # Versões 100% estáveis (tags/branches de release oficiais)
   SWIFT_SCHEME: release/6.3
   SWIFT_BOOTSTRAP_VER: 6.0.3
   RUST_BRANCH: 1.91.0
-  GCC_ADA_BRANCH: releases/gcc-14
-  # Mantidos v3 e v2 para reaproveitar todos os caches que acabaram de ser salvos!
+  # Mantidos v3 e v2 para reaproveitar todos os caches que já foram salvos!
   CORE_CACHE_REV: v3
   FRONTEND_CACHE_REV: v2
   PACKAGE_CACHE_REV: v1
@@ -59,7 +57,7 @@ env:
 
 jobs:
   # ============================================================================
-  # ESTÁGIO 1: Core em Container Ubuntu 26.04 (LLVM + Clang + LLDB + Swift)
+  # ESTÁGIO 1: Core em Container Ubuntu 26.04 (AMD64 + ARM64)
   # ============================================================================
   build-core:
     name: "Stage 1: Core LLVM+Swift [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -71,6 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-26.04
@@ -282,7 +281,7 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # ESTÁGIO 2: Matrix 3x2 em Container Ubuntu 26.04 (Flang, Ada e Rust)
+  # ESTÁGIO 2: Matrix 3x2 Real (6 Jobs em Paralelo: Flang, Ada e Rust x AMD64/ARM64)
   # ============================================================================
   build-parallel-frontends:
     name: "Stage 2: ${{ matrix.component }} [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -296,6 +295,7 @@ jobs:
       fail-fast: false
       matrix:
         component: [flang-mlir, gnat-ada, rust]
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-26.04
@@ -428,19 +428,24 @@ jobs:
       - name: 3B. Compilar GNAT-LLVM Dinâmico (Shared libLLVM.so)
         if: matrix.component == 'gnat-ada' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends make build-essential gnat-14 g++-14 gcc-14 gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
+          apt-get install -y -qq --no-install-recommends make build-essential gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
+          apt-get install -y -qq --no-install-recommends gnat-15 gcc-15 g++-15 || apt-get install -y -qq --no-install-recommends gnat
 
-          ln -sf /usr/bin/gcc-14 /usr/bin/gcc
-          ln -sf /usr/bin/g++-14 /usr/bin/g++
-          ln -sf /usr/bin/gnat-14 /usr/bin/gnat
-          ln -sf /usr/bin/gnatmake-14 /usr/bin/gnatmake
-          ln -sf /usr/bin/gnatbind-14 /usr/bin/gnatbind
-          ln -sf /usr/bin/gnatlink-14 /usr/bin/gnatlink
+          if [ -x /usr/bin/gnat-15 ]; then
+            GNAT_VER=15
+          else
+            GNAT_VER=14
+          fi
+          ln -sf /usr/bin/gcc-${GNAT_VER} /usr/bin/gcc
+          ln -sf /usr/bin/g++-${GNAT_VER} /usr/bin/g++
+          ln -sf /usr/bin/gnat-${GNAT_VER} /usr/bin/gnat
+          ln -sf /usr/bin/gnatmake-${GNAT_VER} /usr/bin/gnatmake
+          ln -sf /usr/bin/gnatbind-${GNAT_VER} /usr/bin/gnatbind
+          ln -sf /usr/bin/gnatlink-${GNAT_VER} /usr/bin/gnatlink
           ln -sf /usr/bin/ld.lld /usr/bin/ld
           ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
           ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
 
-          # Garante que os symlinks sem sufixo (libLLVM.so e libclang-cpp.so) existam em /opt/omnillvm/lib
           LLVM_SO=$(ls "${{ env.INSTALL_PREFIX }}/lib/"libLLVM-*.so "${{ env.INSTALL_PREFIX }}/lib/"libLLVM.so.* 2>/dev/null | head -n 1)
           if [ -n "$LLVM_SO" ] && [ ! -e "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so" ]; then
             ln -sf "$(basename "$LLVM_SO")" "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so"
@@ -459,31 +464,22 @@ jobs:
           cd gnat-llvm
           git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
 
-          git clone --filter=blob:none --no-checkout --depth 1 --branch ${{ env.GCC_ADA_BRANCH }} https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
+          git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
           cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
-          # CORREÇÃO: Usa apenas --link-shared no Makefile (que já injeta -L/opt/omnillvm/lib -lLLVM-21)
-          # e substitui -lclangBasic por -lclang-cpp (sem espaço dentro das aspas do .gpr!)
+          # Garante visibilidade do operador sobre System.CRTL.long em gnatlink.adb
+          sed -i 's/package body Gnatlink is/package body Gnatlink is\n   use type System.CRTL.long;/' \
+            llvm-interface/gnat_src/gnatlink.adb || true
+
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
           sed -i 's/"-lclangBasic"/"-lclang-cpp"/g' llvm-interface/gnat_llvm.gpr 2>/dev/null || true
 
-          if ! make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
+          make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
             GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lclang-cpp" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
-            build; then
-            echo "Sincronizando gnat_src com a árvore de interface do gnat-llvm..."
-            rm -rf llvm-interface/gcc llvm-interface/gnat_src llvm-interface/obj/* llvm-interface/obj-tools/*
-            git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
-            cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
-            ln -s gcc/gcc/ada llvm-interface/gnat_src
-            make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-              GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lclang-cpp" \
-              LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
-              PREFIX="/opt/overlay-install" \
-              build
-          fi
+            build
 
           make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
             GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
@@ -588,6 +584,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-26.04
