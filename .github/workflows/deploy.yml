@@ -477,7 +477,6 @@ jobs:
             git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
           fi
 
-          # Clona gcc/ada na branch releases/gcc-16 (correspondente ao gnat-llvm 27.1 de 2026)
           if git ls-remote --exit-code --heads https://gcc.gnu.org/git/gcc.git "${{ env.GCC_ADA_BRANCH }}" >/dev/null 2>&1; then
             git clone --filter=blob:none --no-checkout --depth 1 --branch "${{ env.GCC_ADA_BRANCH }}" https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
           else
@@ -486,12 +485,10 @@ jobs:
           cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
-          # Garante que Table.Table.Clear exista em table.ads
           if ! grep -q "procedure Clear" llvm-interface/gnat_src/table.ads; then
             sed -i 's/procedure Init;/procedure Init;\n      procedure Clear renames Init;/' llvm-interface/gnat_src/table.ads
           fi
 
-          # Garante visibilidade do operador System.CRTL.long em gnatlink.adb
           python3 - << 'EOF'
           p = "llvm-interface/gnat_src/gnatlink.adb"
           with open(p, "r") as f:
@@ -502,9 +499,6 @@ jobs:
               f.write(txt)
           EOF
 
-          # CORREÇÃO DO ERRO "warning: no entities of Einfo.Utils are referenced [-gnatwu]":
-          # O flag -gnatg ativa -gnatwe (warnings as errors). Adicionamos -gnatwn (normal warnings, nunca falha por warning)
-          # e removemos -Werror de todos os arquivos .gpr!
           sed -i 's/"-Werror"/"-Wno-error"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/"-gnatg"/"-gnatg", "-gnatwn"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
@@ -516,11 +510,19 @@ jobs:
             PREFIX="/opt/overlay-install" \
             build
 
-          make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -cargs:Ada -gnatwn -cargs:C++ -Wno-error" \
-            LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
-            PREFIX="/opt/overlay-install" \
-            install
+          # CORREÇÃO: Copia os binários compilados em llvm-interface/bin/ diretamente para /opt/overlay-install/bin/
+          # (e copia a libgnat/runtime se existir), pois llvm-interface/Makefile não tem target 'install'
+          mkdir -p /opt/overlay-install/bin /opt/overlay-install/lib
+          cp -af llvm-interface/bin/* /opt/overlay-install/bin/
+          # Inclui a runtime Ada do sistema para que llvm-gnatmake funcione standalone
+          ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
+          ADA_INC_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adainclude/system.ads))
+          mkdir -p /opt/overlay-install/lib/rts-native/adalib /opt/overlay-install/lib/rts-native/adainclude
+          cp -af "$ADA_LIB_DIR/"* /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
+          cp -af "$ADA_INC_DIR/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
+          cp -af "$ADA_LIB_DIR/"libgnat*.so* /opt/overlay-install/lib/ 2>/dev/null || true
+          cp -af "$ADA_LIB_DIR/"libgnarl*.so* /opt/overlay-install/lib/ 2>/dev/null || true
+          ls -la /opt/overlay-install/bin/
 
       # --- 3C. Rustc 1.94.0 + Cargo Dinâmicos (-O3 + mold + LLVM 21) ---
       - name: 3C. Compilar Rustc 1.94.0 Dinâmico (link-shared = true + mold)
