@@ -50,10 +50,11 @@ env:
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
-  # Mantidas as chaves de cache da versão 6.4.1 para reaproveitar Stage 1, Flang e Rust!
+  # Mantidos os caches de compilação do Stage 1 e Stage 2!
+  # Incrementado PACKAGE_CACHE_REV para v2-swift641 para rodar o novo Stage 3 + Testes!
   CORE_CACHE_REV: v1-swift641
   FRONTEND_CACHE_REV: v1-swift641-r194-g271
-  PACKAGE_CACHE_REV: v1-swift641
+  PACKAGE_CACHE_REV: v2-swift641
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -510,11 +511,8 @@ jobs:
             PREFIX="/opt/overlay-install" \
             build
 
-          # CORREÇÃO: Copia os binários compilados em llvm-interface/bin/ diretamente para /opt/overlay-install/bin/
-          # (e copia a libgnat/runtime se existir), pois llvm-interface/Makefile não tem target 'install'
           mkdir -p /opt/overlay-install/bin /opt/overlay-install/lib
           cp -af llvm-interface/bin/* /opt/overlay-install/bin/
-          # Inclui a runtime Ada do sistema para que llvm-gnatmake funcione standalone
           ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
           ADA_INC_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adainclude/system.ads))
           mkdir -p /opt/overlay-install/lib/rts-native/adalib /opt/overlay-install/lib/rts-native/adainclude
@@ -608,10 +606,10 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # ESTÁGIO 3: Fusão, Deduplicação por Symlinks, RPATH ($ORIGIN) e Strip
+  # ESTÁGIO 3: Fusão, Deduplicação, Strip e Suíte Industrial de Testes de Runtime
   # ============================================================================
   package-arch:
-    name: "Stage 3: Merge & Strip [Ubuntu 26.04 - ${{ matrix.arch }}]"
+    name: "Stage 3: Merge, Strip & Tests [Ubuntu 26.04 - ${{ matrix.arch }}]"
     needs: [build-core, build-parallel-frontends]
     runs-on: ${{ matrix.runner }}
     container:
@@ -652,7 +650,7 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: Unificar, Deduplicar, Aplicar Strip e Executar Testes de Compatibilidade (ABI/Runtimes)
+      - name: 1. Unificar, Deduplicar e Aplicar Strip Cirúrgico no Ubuntu 26.04
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev libstdc++-15-dev libgcc-15-dev
@@ -671,10 +669,8 @@ jobs:
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
           STRIP="$TOOLCHAIN/bin/llvm-strip"
 
-          # Garante symlinks essenciais para Ada (rts-native) e Fortran/Clang
-          ln -sfn . "$TOOLCHAIN/usr"
           if [ -d "$TOOLCHAIN/lib/rts-native" ]; then
-            ln -sfn "$TOOLCHAIN/lib/rts-native" "$TOOLCHAIN/rts-native"
+            ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
           fi
 
           # 2. Aplica RPATH relativo limpo ($ORIGIN) em todos os binários e libs para nunca exigir LD_LIBRARY_PATH
@@ -688,42 +684,44 @@ jobs:
           rdfind -makesymlinks true -makeresultsfile false "$TOOLCHAIN"
           symlinks -cr "$TOOLCHAIN"
 
-          # 4. Strip Cirúrgico em Paralelo (Preserva DWARF/metadados dos runtimes .rlib, .swiftmodule e adalib)
+          # 4. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
           find "$TOOLCHAIN/bin" -type f -print0 | xargs -0 -n 10 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
           find "$TOOLCHAIN/lib" -maxdepth 1 -type f \( \
             -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" -o \
             -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
           \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
 
-          # 5. Remove TODAS as bibliotecas estáticas (.a) internas do compilador (preservando runtimes de usuário)
+          # 5. Remove TODAS as bibliotecas estáticas (.a) internas do compilador
           rm -f "$TOOLCHAIN/lib"/libLLVM*.a "$TOOLCHAIN/lib"/libclang*.a \
                 "$TOOLCHAIN/lib"/libMLIR*.a "$TOOLCHAIN/lib"/liblldb*.a \
                 "$TOOLCHAIN/lib"/libflang*.a "$TOOLCHAIN/lib"/liblld*.a
 
-          # ====================================================================
-          # 6. SUÍTE INDUSTRIAL DE TESTES DE RUNTIME, ABI E INTEROPERABILIDADE
-          # ====================================================================
-          echo "===================================================================="
-          echo "🧪 INICIANDO AUDITORIA DE RUNTIMES E ABI (PADRÃO CANONICAL / APPLE)"
-          echo "===================================================================="
+      - name: "🧪 2. Suíte Industrial de Testes de Runtime, ABI e Interoperabilidade (${{ matrix.arch }})"
+        if: steps.pkg-cache.outputs.cache-hit != 'true'
+        run: |
+          TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
           export PATH="$TOOLCHAIN/bin:$PATH"
           TEST_DIR=$(mktemp -d /tmp/omnillvm-tests.XXXXXX)
           cd "$TEST_DIR"
 
-          # [6.1] Auditoria de Dependências Dinâmicas (Zero 'not found' e Zero 'libpython')
-          echo "-> [1/7] Verificando integridade ELF (RPATH / ldd) e ausência de libpython..."
+          echo "===================================================================="
+          echo "🧪 INICIANDO AUDITORIA DE RUNTIMES E ABI (PADRÃO CANONICAL / APPLE)"
+          echo "===================================================================="
+
+          # [1/7] Auditoria anti-libpython e RPATH no LLDB
+          echo "-> [1/7] Verificando dependências dinâmicas do LLDB no Ubuntu 26.04..."
+          ldd "$TOOLCHAIN/bin/lldb"
           if ldd "$TOOLCHAIN/bin/lldb" "$TOOLCHAIN/lib/liblldb.so"* | grep -q "libpython"; then
-            echo "❌ ERRO FATAL: libpython encontrada no LLDB!"
+            echo "❌ ERRO FATAL: libpython encontrada no LLDB (${{ matrix.arch }})!"
             exit 1
           fi
-          MISSING_LIBS=$(find "$TOOLCHAIN/bin" -maxdepth 1 -type f -executable -exec ldd {} + 2>/dev/null | grep "not found" || true)
-          if [ -n "$MISSING_LIBS" ]; then
-            echo "⚠️ Aviso de libs dinâmicas pendentes:"
-            echo "$MISSING_LIBS"
-          fi
+          echo "✅ [1/7] LLDB 100% livre de libpython!"
 
-          # [6.2] Teste C23 + C++23 (Compatibilidade ABI GNU/Ubuntu libstdc++ + Unwind/Exceptions)
-          echo "-> [2/7] Testando Clang/Clang++ (ABI Ubuntu libstdc++ + Exceptions + LLD)..."
+          # [2/7] Teste C23 + C++23 (ABI Ubuntu libstdc++ + Unwind/Exceptions + LLD)
+          echo "-> [2/7] Testando Clang/Clang++ (C23 + C++23 + Exceptions + LLD)..."
+          cat << 'EOF' > test_c.c
+          int c_add(int a, int b) { return a + b; }
+          EOF
           cat << 'EOF' > test_cpp.cpp
           #include <iostream>
           #include <vector>
@@ -737,26 +735,21 @@ jobs:
               } catch (const std::exception& e) {
                   std::vector<std::string> v = {"OmniLLVM", "C++23", e.what()};
                   if (c_add(20, 22) != 42 || rust_mul(6, 7) != 42) return 1;
-                  std::cout << "✅ C/C++/Rust FFI & Unwind OK: " << v[0] << " (" << v[2] << ")\n";
+                  std::cout << "✅ [2/7] C/C++/Rust FFI & Unwind OK: " << v[0] << " (" << v[2] << ")\n";
               }
               return 0;
           }
           EOF
-          cat << 'EOF' > test_c.c
-          int c_add(int a, int b) { return a + b; }
-          EOF
           "$TOOLCHAIN/bin/clang" -O3 -c test_c.c -o test_c.o
           "$TOOLCHAIN/bin/clang++" -O3 -std=c++23 -c test_cpp.cpp -o test_cpp.o
 
-          # [6.3] Teste Rust 1.94.0 (Stdlib + Threads + FFI C/C++)
-          echo "-> [3/7] Testando Rustc 1.94.0 (Stdlib + FFI staticlib + executável nativo)..."
+          # [3/7] Teste Rust 1.94.0 (FFI Staticlib + Executável Nativo Multi-thread)
+          echo "-> [3/7] Testando Rustc 1.94.0 (FFI + Stdlib Threads)..."
           cat << 'EOF' > test_rust_ffi.rs
           #[no_mangle]
           pub extern "C" fn rust_mul(a: i32, b: i32) -> i32 { a * b }
           EOF
           "$TOOLCHAIN/bin/rustc" -O --crate-type=staticlib test_rust_ffi.rs -o librust_ffi.a
-
-          # Linka C + C++ + Rust juntos usando ld.lld para provar compatibilidade total de ABI!
           "$TOOLCHAIN/bin/clang++" -O3 -fuse-ld=lld test_cpp.o test_c.o librust_ffi.a -lpthread -ldl -o test_ffi_bin
           ./test_ffi_bin
 
@@ -765,38 +758,38 @@ jobs:
           fn main() {
               let h = thread::spawn(|| (1..=10).sum::<i32>());
               assert_eq!(h.join().unwrap(), 55);
-              println!("✅ Rust 1.94.0 Runtime & Threads OK!");
+              println!("✅ [3/7] Rust 1.94.0 Runtime & Threads OK!");
           }
           EOF
           "$TOOLCHAIN/bin/rustc" -O test_rust_bin.rs -o test_rust_bin
           ./test_rust_bin
 
-          # [6.4] Teste Swift 6.4.1 (Runtime libswiftCore.so + Concurrency/Stdlib)
+          # [4/7] Teste Swift 6.4.1 (swiftc + libswiftCore.so)
           echo "-> [4/7] Testando Swift 6.4.1 (swiftc + libswiftCore.so)..."
           cat << 'EOF' > test_swift.swift
           struct Point { var x: Int; var y: Int }
           let p = Point(x: 20, y: 22)
           assert(p.x + p.y == 42)
-          print("✅ Swift 6.4.1 Runtime & Stdlib OK: \(p.x + p.y)")
+          print("✅ [4/7] Swift 6.4.1 Runtime & Stdlib OK: \(p.x + p.y)")
           EOF
           "$TOOLCHAIN/bin/swiftc" -O test_swift.swift -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin
           ./test_swift_bin
 
-          # [6.5] Teste Ada GNAT-LLVM 27.1 (llvm-gnatmake + Runtime Ada)
-          echo "-> [5/7] Testando Ada GNAT-LLVM 27.1 (llvm-gnatmake + libgnat)..."
+          # [5/7] Teste Ada GNAT-LLVM 27.1 (llvm-gnatmake + libgnat)
+          echo "-> [5/7] Testando Ada GNAT-LLVM 27.1 (llvm-gnatmake + rts-native)..."
           cat << 'EOF' > hello_ada.adb
           with Ada.Text_IO; use Ada.Text_IO;
           procedure Hello_Ada is
              X : constant Integer := 42;
           begin
-             Put_Line ("✅ Ada GNAT-LLVM 27.1 Runtime OK:" & Integer'Image (X));
+             Put_Line ("✅ [5/7] Ada GNAT-LLVM 27.1 Runtime OK:" & Integer'Image (X));
           end Hello_Ada;
           EOF
           "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb --RTS="$TOOLCHAIN/lib/rts-native" -largs -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
           ./hello_ada
 
-          # [6.6] Teste Fortran Flang (Verifica geração de código LLVM no Flang)
-          echo "-> [6/7] Testando Fortran Flang 21 (Compilação para Objeto ELF)..."
+          # [6/7] Teste Fortran Flang 21 (ISO_C_BINDING ABI com Clang)
+          echo "-> [6/7] Testando Fortran Flang 21 (ISO_C_BINDING ABI)..."
           cat << 'EOF' > test_fortran.f90
           pure integer function fort_square(x) bind(c, name="fort_square")
             use iso_c_binding, only: c_int
@@ -811,28 +804,30 @@ jobs:
           extern int fort_square(int x);
           int main() {
               if (fort_square(7) != 49) return 1;
-              printf("✅ Fortran (Flang 21 ISO_C_BINDING) ABI OK: %d\n", fort_square(7));
+              printf("✅ [6/7] Fortran (Flang 21 ISO_C_BINDING) ABI OK: %d\n", fort_square(7));
               return 0;
           }
           EOF
           "$TOOLCHAIN/bin/clang" -O3 test_fort_main.c test_fortran.o -o test_fort_bin
           ./test_fort_bin
 
-          # [6.7] Teste LLDB (Verifica inicialização limpa do Debugger)
-          echo "-> [7/7] Testando LLDB Batch Mode em binário compilado..."
+          # [7/7] Teste LLDB Batch Mode
+          echo "-> [7/7] Testando LLDB Batch Mode..."
           "$TOOLCHAIN/bin/lldb" --batch -o "target create ./test_ffi_bin" -o "run" -o "quit"
+          echo "✅ [7/7] LLDB Batch Execution OK!"
 
           cd /opt && rm -rf "$TEST_DIR"
-          rm -f "$TOOLCHAIN/usr" || true
           echo "===================================================================="
           echo "🎉 TODOS OS 7 TESTES DE COMPATIBILIDADE E RUNTIME PASSARAM COM 100%!"
           echo "===================================================================="
 
-          # 7. Compressão Final ZSTD Nível 19 Multi-Thread
+      - name: 3. Compactar Pacote Final com ZSTD Nível 19 Multi-Thread (${{ matrix.arch }})
+        if: steps.pkg-cache.outputs.cache-hit != 'true'
+        run: |
           cd /opt
           tar -I "zstd -19 -T0" -cf $GITHUB_WORKSPACE/omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst omnillvm
 
-      - name: Salvar Cache do Pacote Final (Stage 3 - ${{ matrix.arch }})
+      - name: 4. Salvar Cache do Pacote Final (Stage 3 - ${{ matrix.arch }})
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -854,7 +849,7 @@ jobs:
     name: "Stage 4: Publish Release (Ubuntu 26.04 AMD64 + ARM64)"
     needs: package-arch
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout (para consultar tags existentes)
