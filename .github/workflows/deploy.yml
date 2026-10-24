@@ -50,11 +50,10 @@ env:
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
-  # Mantidos os caches de compilação do Stage 1 e Stage 2!
-  # Incrementado PACKAGE_CACHE_REV para v2-swift641 para rodar o novo Stage 3 + Testes!
+  # Mantidos os caches de compilação do Stage 1 e Stage 2 (pula direto para o Stage 3!)
   CORE_CACHE_REV: v1-swift641
   FRONTEND_CACHE_REV: v1-swift641-r194-g271
-  PACKAGE_CACHE_REV: v2-swift641
+  PACKAGE_CACHE_REV: v3-swift641
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -650,10 +649,14 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar, Deduplicar e Aplicar Strip Cirúrgico no Ubuntu 26.04
+      - name: 1. Unificar, Empacotar Libs de Sistema (libedit/ncurses), Aplicar RPATH e Strip Cirúrgico
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev libstdc++-15-dev libgcc-15-dev
+          # Instala libedit2 e libncurses6 para embutir na toolchain (tornando-a 100% autossuficiente)
+          apt-get install -y -qq --no-install-recommends \
+            patchelf rdfind symlinks file findutils \
+            libc6-dev libstdc++-15-dev libgcc-15-dev \
+            libedit2 libncurses6 libxml2 libsqlite3-0 libcurl4t64
 
           CORES=$(nproc --all)
           mkdir -p /opt
@@ -673,25 +676,34 @@ jobs:
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
           fi
 
-          # 2. Aplica RPATH relativo limpo ($ORIGIN) em todos os binários e libs para nunca exigir LD_LIBRARY_PATH
+          # 2. Embute libedit.so.2, libncurses.so.6, libpanel.so.6 e libform.so.6 em /opt/omnillvm/lib/
+          # Isso elimina o erro "libedit.so.2: cannot open shared object file" em qualquer máquina!
+          MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
+          for syslib in libedit.so* libncurses.so* libncursesw.so* libpanel.so* libpanelw.so* libform.so* libformw.so*; do
+            cp -af /usr/lib/${MULTIARCH}/${syslib} "$TOOLCHAIN/lib/" 2>/dev/null || true
+            cp -af /lib/${MULTIARCH}/${syslib} "$TOOLCHAIN/lib/" 2>/dev/null || true
+          done
+
+          # 3. Aplica RPATH relativo completo ($ORIGIN) incluindo swift/linux e swift/host!
+          # Isso resolve todos os "lib_CompilerSwift*.so => not found" no LLDB e no Swift!
           find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
-            xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN' 2>/dev/null || true
+            xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN/../lib/swift/host:$ORIGIN' 2>/dev/null || true
 
-          find "$TOOLCHAIN/lib" -maxdepth 2 -type f -name "*.so*" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
-            xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN:$ORIGIN/swift/linux:$ORIGIN/..' 2>/dev/null || true
+          find "$TOOLCHAIN/lib" -maxdepth 3 -type f -name "*.so*" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
+            xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN:$ORIGIN/swift/linux:$ORIGIN/swift/host:$ORIGIN/..:$ORIGIN/../..' 2>/dev/null || true
 
-          # 3. Deduplicação física por Symlinks Relativos
+          # 4. Deduplicação física por Symlinks Relativos
           rdfind -makesymlinks true -makeresultsfile false "$TOOLCHAIN"
           symlinks -cr "$TOOLCHAIN"
 
-          # 4. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
+          # 5. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
           find "$TOOLCHAIN/bin" -type f -print0 | xargs -0 -n 10 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
           find "$TOOLCHAIN/lib" -maxdepth 1 -type f \( \
             -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" -o \
             -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
           \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
 
-          # 5. Remove TODAS as bibliotecas estáticas (.a) internas do compilador
+          # 6. Remove TODAS as bibliotecas estáticas (.a) internas do compilador
           rm -f "$TOOLCHAIN/lib"/libLLVM*.a "$TOOLCHAIN/lib"/libclang*.a \
                 "$TOOLCHAIN/lib"/libMLIR*.a "$TOOLCHAIN/lib"/liblldb*.a \
                 "$TOOLCHAIN/lib"/libflang*.a "$TOOLCHAIN/lib"/liblld*.a
@@ -715,7 +727,12 @@ jobs:
             echo "❌ ERRO FATAL: libpython encontrada no LLDB (${{ matrix.arch }})!"
             exit 1
           fi
-          echo "✅ [1/7] LLDB 100% livre de libpython!"
+          if ldd "$TOOLCHAIN/bin/lldb" | grep -q "not found"; then
+            echo "❌ ERRO FATAL: Bibliotecas ausentes (not found) no LLDB (${{ matrix.arch }})!"
+            ldd "$TOOLCHAIN/bin/lldb" | grep "not found"
+            exit 1
+          fi
+          echo "✅ [1/7] LLDB 100% livre de libpython e com todas as libs resolvidas via RPATH!"
 
           # [2/7] Teste C23 + C++23 (ABI Ubuntu libstdc++ + Unwind/Exceptions + LLD)
           echo "-> [2/7] Testando Clang/Clang++ (C23 + C++23 + Exceptions + LLD)..."
