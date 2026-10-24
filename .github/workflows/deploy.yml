@@ -50,7 +50,7 @@ env:
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-15
-  # Novas chaves limpas para a versão 6.4.1
+  # Chaves de Cache limpas para a versão 6.4.1
   CORE_CACHE_REV: v1-swift641
   FRONTEND_CACHE_REV: v1-swift641-r194-g271
   PACKAGE_CACHE_REV: v1-swift641
@@ -156,45 +156,12 @@ jobs:
             omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
 
-      - name: 3. Clonar Swift 6.4.1 + LLVM 21 (swift/release/6.4.1) Sem Conflito de Merge
+      - name: 3. Clonar Swift 6.4.1 + LLVM 21 (release/6.4.1) em Paralelo
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
-
-          # Clona o repositório swift na branch release/6.4.1 (ou release/6.4 se swift principal usar nome curto)
-          if git ls-remote --exit-code --heads https://github.com/swiftlang/swift.git "${{ env.SWIFT_SCHEME }}" >/dev/null 2>&1; then
-            SWIFT_GIT_BRANCH="${{ env.SWIFT_SCHEME }}"
-          else
-            SWIFT_GIT_BRANCH="release/6.4"
-          fi
-          echo "Clonando swiftlang/swift na branch: $SWIFT_GIT_BRANCH"
-          git clone --branch "$SWIFT_GIT_BRANCH" --depth 1 --single-branch https://github.com/swiftlang/swift.git
-
-          # Registra o scheme exato no update-checkout-config.json alinhado com SWIFT_GIT_BRANCH e swift/release/6.4.1
-          # Isso impede que o update-checkout tente fazer rebase/merge na pasta swift já clonada!
-          python3 - <<EOF
-          import json
-          cfg_path = "swift/utils/update-checkout-config.json"
-          with open(cfg_path, "r") as f:
-              data = json.load(f)
-          schemes = data.get("branch-schemes", {})
-          base_scheme = "release/6.4.1" if "release/6.4.1" in schemes else ("release/6.4" if "release/6.4" in schemes else "release/6.3")
-          import copy
-          new_scheme = copy.deepcopy(schemes[base_scheme])
-          new_scheme["repos"]["swift"] = "$SWIFT_GIT_BRANCH"
-          new_scheme["repos"]["llvm-project"] = "${{ env.SWIFT_LLVM_BRANCH }}"
-          schemes["${{ env.SWIFT_SCHEME }}"] = new_scheme
-          with open(cfg_path, "w") as f:
-              json.dump(data, f, indent=2)
-          print(f"Scheme '${{ env.SWIFT_SCHEME }}' configurado com sucesso (base: {base_scheme}) -> llvm-project: ${{ env.SWIFT_LLVM_BRANCH }}")
-          EOF
-
-          # Faz commit local do config para que o update-checkout veja a árvore limpa e pule o merge do swift
-          git -C swift config user.email "builder@omnillvm.local"
-          git -C swift config user.name "OmniLLVM Builder"
-          git -C swift commit -am "Lock scheme ${{ env.SWIFT_SCHEME }}" || true
-
-          ./swift/utils/update-checkout --clone --scheme "${{ env.SWIFT_SCHEME }}" --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
+          git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
+          ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
 
       - name: 4. Compilar Core 6.4.1 com Otimização Máxima (-O3 + --no-assertions + libLLVM.so Nativa)
         if: steps.core-cache.outputs.cache-hit != 'true'
