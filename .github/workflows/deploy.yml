@@ -11,7 +11,7 @@ on:
         required: false
         default: ''
       rebuild_core:
-        description: 'Forçar recompilação do Stage 1 do zero? (false = usa cache em 25s)'
+        description: 'Forçar recompilação do Stage 1 do zero? (false = usa cache)'
         required: false
         default: 'false'
         type: choice
@@ -26,22 +26,31 @@ on:
         options:
           - 'false'
           - 'true'
+      rebuild_package:
+        description: 'Forçar re-empacotamento do Stage 3? (false = usa cache)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: write
 
 env:
   INSTALL_PREFIX: /opt/omnillvm
+  # Todas as versões fixadas em branches/tags de release ESTÁVEIS (zero master/experimental)
   SWIFT_SCHEME: release/6.3
   SWIFT_BOOTSTRAP_VER: 6.0.3
   RUST_BRANCH: 1.91.0
-  # Mude estes números se quiser invalidar o cache de algum estágio via git push
+  GCC_ADA_BRANCH: releases/gcc-14
+  # Mantido v2 para reaproveitar imediatamente o cache que já foi salvo no Stage 1 e no Flang!
   CORE_CACHE_REV: v2
   FRONTEND_CACHE_REV: v2
+  PACKAGE_CACHE_REV: v1
   DEBIAN_FRONTEND: noninteractive
-  # Otimização MÁXIMA para o binário final (-O3 -fno-plt) + I/O em RAM (-pipe) + zero peso morto (-g0 -DNDEBUG)
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
-  # ccache configurado em memória RAM (/dev/shm) para latência zero
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
@@ -50,7 +59,7 @@ env:
 
 jobs:
   # ============================================================================
-  # ESTÁGIO 1: Core em Container Ubuntu 26.04 (Pula em 25s se já estiver em Cache!)
+  # ESTÁGIO 1: Core em Container Ubuntu 26.04 (Cache Total do Tarball + ccache)
   # ============================================================================
   build-core:
     name: "Stage 1: Core LLVM+Swift [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -78,14 +87,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # FAST-SKIP STAGE 1: Se o Core SDK já foi compilado antes, restaura em ~20s e pula tudo!
-      - name: 0. Cache do Core SDK Pronto (Pula os 26 min de build se existir!)
+      # CACHE DO ESTÁGIO 1: Restaura core-sdk-<arch>.tar.zst em ~20s se já existir!
+      - name: 0. Cache do Core SDK Pronto (Stage 1)
         id: core-cache
         if: inputs.rebuild_core != 'true'
         uses: actions/cache@v4
         with:
           path: core-sdk-${{ matrix.arch }}.tar.zst
           key: omnillvm-core-tarball-${{ env.CORE_CACHE_REV }}-${{ env.SWIFT_SCHEME }}-${{ matrix.arch }}
+          restore-keys: |
+            omnillvm-core-tarball-${{ env.CORE_CACHE_REV }}-${{ env.SWIFT_SCHEME }}-${{ matrix.arch }}
+            omnillvm-core-tarball-v2-${{ env.SWIFT_SCHEME }}-${{ matrix.arch }}
+          save-always: true
 
       - name: 1. Instalar Dependências, Swift Host Bootstrap e Tuning Máximo de CPU/RAM
         id: hw
@@ -135,7 +148,7 @@ jobs:
             omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
 
-      - name: 3. Clonar Swift + LLVM 21 em Paralelo
+      - name: 3. Clonar Swift + LLVM 21 Estáveis em Paralelo
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
@@ -167,7 +180,7 @@ jobs:
             --jobs ${{ steps.hw.outputs.compile_jobs }} \
             --install-all \
             --install-destdir="${{ env.INSTALL_PREFIX }}" \
-            --install-prefix="/" \
+            --install-prefix="/usr" \
             --cross-compile-append-host-target-to-destdir=False \
             --extra-cmake-options="\
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -186,8 +199,8 @@ jobs:
               -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
               -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
               -DLLVM_BUILD_LLVM_DYLIB=ON \
-              -DLLVM_LINK_LLVM_DYLIB=OFF \
-              -DCLANG_LINK_CLANG_DYLIB=OFF \
+              -DLLVM_LINK_LLVM_DYLIB=ON \
+              -DCLANG_LINK_CLANG_DYLIB=ON \
               -DLLVM_INSTALL_UTILS=ON \
               -DLLVM_ENABLE_LIBXML2=OFF \
               -DLLVM_ENABLE_ZSTD=OFF \
@@ -202,16 +215,17 @@ jobs:
               -DLLVM_INCLUDE_BENCHMARKS=OFF \
               -DLLVM_ENABLE_BINDINGS=OFF"
 
-          rm -rf /opt/swift-bootstrap
-
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
 
+          # Instala antes de remover /opt/swift-bootstrap (evita erro de swiftrt.o missing!)
           ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp FileCheck
           DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR" install
           if [ -n "$SWIFT_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$SWIFT_BUILD_DIR" install || true; fi
           if [ -n "$LLDB_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLDB_BUILD_DIR" install || true; fi
+
+          rm -rf /opt/swift-bootstrap
 
           for sub in usr/local usr local linux-x86_64 linux-aarch64; do
             if [ -d "${{ env.INSTALL_PREFIX }}/$sub" ]; then
@@ -231,9 +245,9 @@ jobs:
           cp -f "$LLVM_BUILD_DIR/bin/lld" "${{ env.INSTALL_PREFIX }}/bin/" || true
           ln -sf lld "${{ env.INSTALL_PREFIX }}/bin/ld.lld" || true
           ln -sf clang "${{ env.INSTALL_PREFIX }}/bin/clang++" || true
-          cp -rn "$LLVM_BUILD_DIR/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
-          cp -rn "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" || true
-          cp -rn "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" || true
+          cp -ru "$LLVM_BUILD_DIR/include/"* "${{ env.INSTALL_PREFIX }}/include/" 2>/dev/null || true
+          cp -ru "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" 2>/dev/null || true
+          cp -ru "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" 2>/dev/null || true
 
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
           ls -la "${{ env.INSTALL_PREFIX }}/bin/clang" "${{ env.INSTALL_PREFIX }}/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
@@ -254,7 +268,7 @@ jobs:
 
   # ============================================================================
   # ESTÁGIO 2: Matrix 3x2 em Container Ubuntu 26.04 (Flang, Ada e Rust)
-  # Agora CADA componente também salva seu overlay .tar.zst pronto em cache!
+  # Cada componente salva e restaura seu próprio cache .tar.zst!
   # ============================================================================
   build-parallel-frontends:
     name: "Stage 2: ${{ matrix.component }} [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -280,8 +294,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # FAST-SKIP STAGE 2: Se este componente (ex: flang, ada ou rust) já compilou com sucesso antes,
-      # restaura o overlay pronto em ~10 segundos e pula a compilação!
+      # CACHE DO ESTÁGIO 2: Flang (que já deu certo!) será restaurado em ~10s sem recompilar!
       - name: 0. Cache do Overlay Pronto (${{ matrix.component }}-${{ matrix.arch }})
         id: overlay-cache
         if: inputs.rebuild_frontends != 'true'
@@ -289,6 +302,10 @@ jobs:
         with:
           path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
           key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
+          restore-keys: |
+            omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
+            omnillvm-overlay-tarball-v2-${{ matrix.component }}-${{ matrix.arch }}
+          save-always: true
 
       - name: 1. Baixar Core SDK (${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
@@ -296,7 +313,7 @@ jobs:
         with:
           name: core-sdk-${{ matrix.arch }}
 
-      - name: Extrair Core SDK e Configurar CPUs/RAM no Ubuntu 26.04
+      - name: Extrair Core SDK, Corrigir llvm-config (--link-shared) e Configurar CPUs/RAM
         id: hw
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
@@ -325,6 +342,68 @@ jobs:
           fi
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
 
+          # CORREÇÃO DEFINITIVA DO ERRO "llvm-config: error: missing: /opt/omnillvm/lib/libLLVM*.so":
+          # Quando o Core SDK tem a dylib monolítica (libLLVM.so) mas foi gerado com LLVM_LINK_LLVM_DYLIB=OFF,
+          # chamar `llvm-config --link-shared --libs` falha procurando 80 arquivos libLLVM*.so separados.
+          # Este wrapper intercepta `--link-shared` e retorna `-lLLVM` apontando para a libLLVM.so monolítica!
+          if [ ! -f "${{ env.INSTALL_PREFIX }}/bin/llvm-config.real" ]; then
+            mv "${{ env.INSTALL_PREFIX }}/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/llvm-config.real"
+            cat << 'EOF' > "${{ env.INSTALL_PREFIX }}/bin/llvm-config"
+          #!/bin/sh
+          REAL_CFG="$(dirname "$0")/llvm-config.real"
+          HAS_SHARED=0
+          WANT_LIBS=0
+          WANT_LIBFILES=0
+           WANT_LIBNAMES=0
+          ARGS=""
+          for arg in "$@"; do
+            case "$arg" in
+              --link-shared) HAS_SHARED=1 ;;
+              --libs) WANT_LIBS=1; ARGS="$ARGS $arg" ;;
+              --libfiles) WANT_LIBFILES=1; ARGS="$ARGS $arg" ;;
+              --libnames) WANT_LIBNAMES=1; ARGS="$ARGS $arg" ;;
+              *) ARGS="$ARGS $arg" ;;
+            esac
+          done
+          if [ "$HAS_SHARED" = "1" ]; then
+            if "$REAL_CFG" "$@" >/dev/null 2>&1; then
+              exec "$REAL_CFG" "$@"
+            fi
+            LIBDIR=$("$REAL_CFG" --libdir)
+            DYLIB=$(ls "$LIBDIR"/libLLVM-*.so "$LIBDIR"/libLLVM.so 2>/dev/null | head -n 1)
+            if [ -n "$DYLIB" ]; then
+              if [ "$WANT_LIBFILES" = "1" ]; then
+                echo "$DYLIB"
+                exit 0
+              elif [ "$WANT_LIBNAMES" = "1" ]; then
+                basename "$DYLIB"
+                exit 0
+              elif [ "$WANT_LIBS" = "1" ]; then
+                # Remove --libs para processar demais flags (ex: --system-libs) e adiciona -lLLVM
+                OTHER_ARGS=""
+                for a in $ARGS; do
+                  [ "$a" != "--libs" ] && OTHER_ARGS="$OTHER_ARGS $a"
+                done
+                if [ -n "$OTHER_ARGS" ]; then
+                  SYS=$("$REAL_CFG" $OTHER_ARGS)
+                  echo "-lLLVM $SYS"
+                else
+                  echo "-lLLVM"
+                fi
+                exit 0
+              fi
+            fi
+            exec "$REAL_CFG" $ARGS
+          else
+            exec "$REAL_CFG" "$@"
+          fi
+          EOF
+            chmod +x "${{ env.INSTALL_PREFIX }}/bin/llvm-config"
+          fi
+
+          # Teste rápido de sanidade do novo llvm-config
+          "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
+
       - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
@@ -348,7 +427,6 @@ jobs:
           git clone --filter=blob:none --no-checkout --depth 1 --branch swift/${{ env.SWIFT_SCHEME }} https://github.com/swiftlang/llvm-project.git
           cd llvm-project
           git sparse-checkout init --cone
-          # CORREÇÃO: Adicionado 'third-party' (contém siphash/SipHash.h exigido pelo LLVMSupport no LLVM 21)
           git sparse-checkout set cmake llvm mlir flang clang third-party runtimes flang-rt compiler-rt
           git checkout
 
@@ -397,13 +475,15 @@ jobs:
         run: |
           apt-get install -y -qq --no-install-recommends make build-essential gnat-14 g++-14 gcc-14 gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
 
-          # CORREÇÃO: Alinha gcc/g++ com a exata versão do gnat-14 para evitar conflito C23 (GCC 15) vs GNAT 14 em link.c
           ln -sf /usr/bin/gcc-14 /usr/bin/gcc
           ln -sf /usr/bin/g++-14 /usr/bin/g++
           ln -sf /usr/bin/gnat-14 /usr/bin/gnat
           ln -sf /usr/bin/gnatmake-14 /usr/bin/gnatmake
           ln -sf /usr/bin/gnatbind-14 /usr/bin/gnatbind
           ln -sf /usr/bin/gnatlink-14 /usr/bin/gnatlink
+          ln -sf /usr/bin/ld.lld /usr/bin/ld
+          ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
+          ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
@@ -414,19 +494,33 @@ jobs:
           cd gnat-llvm
           git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
 
-          # Inclui gcc/ada e include do GCC para que link.c tenha todos os cabeçalhos (ansidecl.h, system.h, etc.)
-          git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
+          # Clona a branch ESTÁVEL releases/gcc-14 (compatível com o gnat-14 do sistema),
+          # fazendo fallback para master apenas se gnat-llvm exigir arquivos novos do GCC
+          git clone --filter=blob:none --no-checkout --depth 1 --branch ${{ env.GCC_ADA_BRANCH }} https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
           cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
+          # Garante linkagem contra a libLLVM.so monolítica e libclang-cpp.so (evita undefined reference em libclangBasic.a)
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
+          sed -i 's/-lclangBasic/-lclang-cpp -lLLVM/g' llvm-interface/gnat_llvm.gpr llvm-interface/Makefile 2>/dev/null || true
 
-          # Força gprconfig a usar gcc-14 + gnat-14 consistentemente e mostra qualquer erro real (-v)
-          make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -v" \
+          # Se a branch releases/gcc-14 tiver diferença de especificação com o gnat-llvm atual, alterna o gcc/ada automaticamente
+          if ! make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
+            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lLLVM -lclang-cpp" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
-            build
+            build; then
+            echo "Sincronizando gnat_src com a árvore de interface do gnat-llvm..."
+            rm -rf llvm-interface/gcc llvm-interface/gnat_src llvm-interface/obj/* llvm-interface/obj-tools/*
+            git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
+            cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
+            ln -s gcc/gcc/ada llvm-interface/gnat_src
+            make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
+              GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lLLVM -lclang-cpp" \
+              LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
+              PREFIX="/opt/overlay-install" \
+              build
+          fi
 
           make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
             GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }}" \
@@ -443,7 +537,7 @@ jobs:
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
           export TMPDIR="/tmp"
-          export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+          export RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-L${{ env.INSTALL_PREFIX }}/lib"
 
           if [ ! -f "${{ env.INSTALL_PREFIX }}/bin/FileCheck" ]; then
             printf '#!/bin/sh\nexit 0\n' > "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
@@ -454,10 +548,8 @@ jobs:
           git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
           cd rust
 
-          # CORREÇÃO: Adapta PassWrapper.cpp do Rust 1.91 para a assinatura de PGOOptions do LLVM 21 (Swift 6.3),
-          # onde o parâmetro 'FS' (FileSystem) não existe no construtor de PGOOptions.h
+          # Patch de compatibilidade de assinatura do PGOOptions no LLVM 21 do Swift 6.3
           if ! grep -q "FileSystem" "${{ env.INSTALL_PREFIX }}/include/llvm/Support/PGOOptions.h"; then
-            echo "Aplicando patch de compatibilidade PGOOptions (LLVM 21 Swift) em PassWrapper.cpp..."
             sed -i 's/"", "", "", FS,/"", "", "",/g' compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
           fi
 
@@ -520,6 +612,7 @@ jobs:
 
   # ============================================================================
   # ESTÁGIO 3: Fusão, Deduplicação por Symlinks, RPATH ($ORIGIN) e Strip
+  # Agora também com Cache do Pacote Final!
   # ============================================================================
   package-arch:
     name: "Stage 3: Merge & Strip [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -539,13 +632,28 @@ jobs:
             runner: ubuntu-26.04-arm
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # CACHE DO ESTÁGIO 3: Se o pacote final já estiver em cache, pula a descompressão e o zstd -19!
+      - name: 0. Cache do Pacote Final Pronto (Stage 3 - ${{ matrix.arch }})
+        id: pkg-cache
+        if: inputs.rebuild_package != 'true' && inputs.rebuild_frontends != 'true' && inputs.rebuild_core != 'true'
+        uses: actions/cache@v4
+        with:
+          path: omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst
+          key: omnillvm-final-pkg-${{ env.PACKAGE_CACHE_REV }}-${{ env.CORE_CACHE_REV }}-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.arch }}
+          save-always: true
+
       - name: Baixar Artefatos (${{ matrix.arch }})
+        if: steps.pkg-cache.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
       - name: Unificar, Deduplicar e Aplicar Strip Cirúrgico no Ubuntu 26.04
+        if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks zstd file findutils
