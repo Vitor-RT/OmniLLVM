@@ -53,7 +53,7 @@ env:
   # Mantidos os caches de compilação do Stage 1 e Stage 2 (pula direto para o Stage 3!)
   CORE_CACHE_REV: v1-swift641
   FRONTEND_CACHE_REV: v1-swift641-r194-g271
-  PACKAGE_CACHE_REV: v9-pure-swiftllvm
+  PACKAGE_CACHE_REV: v10-libdispatch-apt
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -116,7 +116,7 @@ jobs:
             git cmake ninja-build make clang lld mold ccache patchelf curl \
             python3 pkg-config libncurses-dev libedit-dev \
             libxml2-dev uuid-dev libicu-dev libsqlite3-dev \
-            libcurl4-openssl-dev libblocksruntime-dev zlib1g-dev xz-utils file procps
+            libcurl4-openssl-dev libblocksruntime-dev libdispatch-dev zlib1g-dev xz-utils file procps
 
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
@@ -746,7 +746,7 @@ jobs:
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
 
-          # 4. Gera o script install-ubuntu26.04-deps.sh (Apenas libs de SO do Ubuntu 26.04 — Zero GCC e Zero conflito de LLVM!)
+          # 4. Gera o script install-ubuntu26.04-deps.sh incluindo libdispatch-dev e libblocksruntime-dev!
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
           set -euo pipefail
@@ -765,14 +765,15 @@ jobs:
             zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 \
             libicu78 libsqlite3-0 libcurl4t64 libxml2-16 \
             libssl3t64 libssl-dev \
-            libblocksruntime0 libgnat-15
+            libdispatch-dev libblocksruntime-dev libblocksruntime0 \
+            libgnat-15
           echo "✅ Todas as bibliotecas dinâmicas de sistema do Ubuntu 26.04 foram instaladas com sucesso!"
           EOF
           chmod +x "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
 
-          # 5. Cria symlinks em $TOOLCHAIN/lib para as bibliotecas internas do compilador Swift (lib_CompilerSwift*.so)
-          find "$TOOLCHAIN" \( -name "lib_Compiler*.so*" -o -name "libSwift*.so*" \) 2>/dev/null | while read -r f; do
-            if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ]; then
+          # 5. Cria symlinks em $TOOLCHAIN/lib para TODAS as bibliotecas .so dentro de $TOOLCHAIN/lib/swift/
+          find "$TOOLCHAIN/lib/swift" -type f -name "*.so*" 2>/dev/null | while read -r f; do
+            if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ] && [ ! -e "$TOOLCHAIN/lib/$(basename "$f")" ]; then
               ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
             fi
           done
@@ -1007,7 +1008,7 @@ jobs:
             fi
           fi
 
-          # Gera o script standalone install-ubuntu26.04-deps.sh (Apenas libs de SO do Ubuntu 26.04)
+          # Gera o script standalone install-ubuntu26.04-deps.sh incluindo libdispatch-dev e libblocksruntime-dev
           cat << 'EOF' > install-ubuntu26.04-deps.sh
           #!/usr/bin/env bash
           set -euo pipefail
@@ -1026,7 +1027,8 @@ jobs:
             zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 \
             libicu78 libsqlite3-0 libcurl4t64 libxml2-16 \
             libssl3t64 libssl-dev \
-            libblocksruntime0 libgnat-15
+            libdispatch-dev libblocksruntime-dev libblocksruntime0 \
+            libgnat-15
           echo "✅ Dependências de sistema instaladas! Extraia o pacote em /opt/omnillvm e adicione /opt/omnillvm/bin ao PATH."
           EOF
           chmod +x install-ubuntu26.04-deps.sh
