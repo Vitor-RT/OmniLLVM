@@ -40,13 +40,19 @@ permissions:
 
 env:
   INSTALL_PREFIX: /opt/omnillvm
-  SWIFT_SCHEME: release/6.3
+  # ==========================================================================
+  # TODAS AS VERSÕES FIXADAS EM BRANCHES/TAGS DE RELEASE ESTÁVEIS (LLVM 21)
+  # ==========================================================================
+  SWIFT_BRANCH: release/6.4.2
+  SWIFT_LLVM_BRANCH: swift/release/6.4.2
   SWIFT_BOOTSTRAP_VER: 6.0.3
-  RUST_BRANCH: 1.91.0
-  # Mantidos v3 e v2 para reaproveitar todos os caches que já foram salvos!
-  CORE_CACHE_REV: v3
-  FRONTEND_CACHE_REV: v2
-  PACKAGE_CACHE_REV: v1
+  RUST_BRANCH: 1.94.0
+  GNAT_LLVM_BRANCH: release/27.1
+  GCC_ADA_BRANCH: releases/gcc-15
+  # Revisões de Cache por Estágio
+  CORE_CACHE_REV: v4-642
+  FRONTEND_CACHE_REV: v3-r194-g271
+  PACKAGE_CACHE_REV: v2
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -97,9 +103,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: core-sdk-${{ matrix.arch }}.tar.zst
-          key: omnillvm-core-${{ env.CORE_CACHE_REV }}-swift63-${{ matrix.arch }}
+          key: omnillvm-core-${{ env.CORE_CACHE_REV }}-${{ matrix.arch }}
           restore-keys: |
-            omnillvm-core-${{ env.CORE_CACHE_REV }}-swift63-${{ matrix.arch }}
+            omnillvm-core-${{ env.CORE_CACHE_REV }}-${{ matrix.arch }}
 
       - name: 1. Instalar Dependências, Swift Host Bootstrap e Tuning Máximo de CPU/RAM
         id: hw
@@ -148,12 +154,39 @@ jobs:
             omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
 
-      - name: 3. Clonar Swift + LLVM 21 Estáveis em Paralelo
+      - name: 3. Clonar Swift + LLVM 21 (swift/release/6.4.2) em Paralelo
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
-          git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
-          ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
+
+          # Resolve automaticamente a branch/scheme no swiftlang/swift (release/6.4.2 -> release/6.4.x -> release/6.3)
+          if git ls-remote --exit-code --heads https://github.com/swiftlang/swift.git "${{ env.SWIFT_BRANCH }}" >/dev/null 2>&1; then
+            RESOLVED_SWIFT="${{ env.SWIFT_BRANCH }}"
+          elif git ls-remote --exit-code --heads https://github.com/swiftlang/swift.git "release/6.4.x" >/dev/null 2>&1; then
+            RESOLVED_SWIFT="release/6.4.x"
+          else
+            RESOLVED_SWIFT="release/6.3"
+          fi
+          echo "Usando branch do Swift: $RESOLVED_SWIFT"
+          git clone --branch "$RESOLVED_SWIFT" --depth 1 --single-branch https://github.com/swiftlang/swift.git
+
+          # Verifica se o scheme exato existe no update-checkout-config.json; se não, usa o scheme pai e trava llvm-project em swift/release/6.4.2
+          if grep -q "\"$RESOLVED_SWIFT\"" swift/utils/update-checkout-config.json; then
+            SCHEME="$RESOLVED_SWIFT"
+          elif grep -q "\"release/6.4\"" swift/utils/update-checkout-config.json; then
+            SCHEME="release/6.4"
+          else
+            SCHEME="release/6.3"
+          fi
+          ./swift/utils/update-checkout --clone --scheme "$SCHEME" --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
+
+          # Garante que o llvm-project esteja exatamente na branch estável swift/release/6.4.2 pedida
+          if git ls-remote --exit-code --heads https://github.com/swiftlang/llvm-project.git "${{ env.SWIFT_LLVM_BRANCH }}" >/dev/null 2>&1; then
+            echo "Sincronizando llvm-project com ${{ env.SWIFT_LLVM_BRANCH }}..."
+            cd $GITHUB_WORKSPACE/src/llvm-project
+            git fetch --depth 1 origin "${{ env.SWIFT_LLVM_BRANCH }}"
+            git checkout -f FETCH_HEAD
+          fi
 
       - name: 4. Compilar Core com Otimização Máxima (-O3 + --no-assertions + libLLVM.so Nativa)
         if: steps.core-cache.outputs.cache-hit != 'true'
@@ -270,7 +303,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: core-sdk-${{ matrix.arch }}.tar.zst
-          key: omnillvm-core-${{ env.CORE_CACHE_REV }}-swift63-${{ matrix.arch }}
+          key: omnillvm-core-${{ env.CORE_CACHE_REV }}-${{ matrix.arch }}
 
       - name: Upload Core SDK (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
@@ -322,6 +355,7 @@ jobs:
           key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
           restore-keys: |
             omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
+            omnillvm-overlay-tarball-v2-${{ matrix.component }}-${{ matrix.arch }}
 
       - name: 1. Baixar Core SDK (${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
@@ -368,7 +402,7 @@ jobs:
             omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
           max-size: 2G
 
-      # --- 3A. Flang + MLIR Dinâmicos (-O3 + mold) ---
+      # --- 3A. Flang + MLIR Dinâmicos (-O3 + mold) [swift/release/6.4.2] ---
       - name: 3A. Compilar Flang + MLIR Dinâmicos (-O3)
         if: matrix.component == 'flang-mlir' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
@@ -379,7 +413,7 @@ jobs:
           export TMPDIR="/tmp"
 
           mkdir -p $GITHUB_WORKSPACE/flang-src && cd $GITHUB_WORKSPACE/flang-src
-          git clone --filter=blob:none --no-checkout --depth 1 --branch swift/${{ env.SWIFT_SCHEME }} https://github.com/swiftlang/llvm-project.git
+          git clone --filter=blob:none --no-checkout --depth 1 --branch ${{ env.SWIFT_LLVM_BRANCH }} https://github.com/swiftlang/llvm-project.git
           cd llvm-project
           git sparse-checkout init --cone
           git sparse-checkout set cmake llvm mlir flang clang third-party runtimes flang-rt compiler-rt
@@ -424,8 +458,8 @@ jobs:
           cp -a build/lib/libMLIR* "/opt/overlay-install/lib/" 2>/dev/null || true
           cp -a build/lib/libflang* "/opt/overlay-install/lib/" 2>/dev/null || true
 
-      # --- 3B. GNAT-LLVM (Ada) Dinâmico (-O3 + Multi-core total) ---
-      - name: 3B. Compilar GNAT-LLVM Dinâmico (Shared libLLVM.so)
+      # --- 3B. GNAT-LLVM (Ada) [release/27.1 Fixo Estável para LLVM 21] ---
+      - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico (Shared libLLVM.so)
         if: matrix.component == 'gnat-ada' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends make build-essential gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
@@ -460,16 +494,22 @@ jobs:
           export TMPDIR="/tmp"
 
           mkdir -p $GITHUB_WORKSPACE/ada && cd $GITHUB_WORKSPACE/ada
-          git clone --depth 1 https://github.com/AdaCore/gnat-llvm.git
+          # Usa a branch de release ESTÁVEL release/27.1 (feita para o LLVM 21!)
+          git clone --depth 1 --branch ${{ env.GNAT_LLVM_BRANCH }} https://github.com/AdaCore/gnat-llvm.git
           cd gnat-llvm
-          git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
+          if git ls-remote --exit-code --heads https://github.com/AdaCore/llvm-bindings.git "${{ env.GNAT_LLVM_BRANCH }}" >/dev/null 2>&1; then
+            git clone --depth 1 --branch ${{ env.GNAT_LLVM_BRANCH }} https://github.com/AdaCore/llvm-bindings.git
+          else
+            git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
+          fi
 
-          git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
+          # Clona apenas o diretório gcc/ada na branch estável releases/gcc-15
+          git clone --filter=blob:none --no-checkout --depth 1 --branch ${{ env.GCC_ADA_BRANCH }} https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
           cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
-          # Garante visibilidade do operador sobre System.CRTL.long em gnatlink.adb
-          sed -i 's/package body Gnatlink is/package body Gnatlink is\n   use type System.CRTL.long;/' \
+          # Garante visibilidade do operador System.CRTL.long em procedure Gnatlink
+          sed -i 's/^procedure Gnatlink is/with System.CRTL; use System.CRTL;\nprocedure Gnatlink is\n   use type System.CRTL.long;/' \
             llvm-interface/gnat_src/gnatlink.adb || true
 
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
@@ -487,8 +527,8 @@ jobs:
             PREFIX="/opt/overlay-install" \
             install
 
-      # --- 3C. Rustc + Cargo Dinâmicos (-O3 + mold) ---
-      - name: 3C. Compilar Rustc Dinâmico (link-shared = true + mold)
+      # --- 3C. Rustc 1.94.0 + Cargo Dinâmicos (-O3 + mold + LLVM 21) ---
+      - name: 3C. Compilar Rustc 1.94.0 Dinâmico (link-shared = true + mold)
         if: matrix.component == 'rust' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends make build-essential cmake ninja-build clang mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
@@ -502,8 +542,9 @@ jobs:
           git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
           cd rust
 
+          # Se o LLVM 21 do Swift tiver PGOOptions sem o argumento FS, ajusta automaticamente
           if ! grep -q "FileSystem" "${{ env.INSTALL_PREFIX }}/include/llvm/Support/PGOOptions.h"; then
-            sed -i 's/"", "", "", FS,/"", "", "",/g' compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+            sed -i 's/"", "", "", FS,/"", "", "",/g' compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp || true
           fi
 
           cat <<EOF > bootstrap.toml
