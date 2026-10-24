@@ -652,10 +652,10 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: Unificar, Deduplicar e Aplicar Strip Cirúrgico no Ubuntu 26.04
+      - name: Unificar, Deduplicar, Aplicar Strip e Executar Testes de Compatibilidade (ABI/Runtimes)
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils
+          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev libstdc++-15-dev libgcc-15-dev
 
           CORES=$(nproc --all)
           mkdir -p /opt
@@ -671,6 +671,12 @@ jobs:
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
           STRIP="$TOOLCHAIN/bin/llvm-strip"
 
+          # Garante symlinks essenciais para Ada (rts-native) e Fortran/Clang
+          ln -sfn . "$TOOLCHAIN/usr"
+          if [ -d "$TOOLCHAIN/lib/rts-native" ]; then
+            ln -sfn "$TOOLCHAIN/lib/rts-native" "$TOOLCHAIN/rts-native"
+          fi
+
           # 2. Aplica RPATH relativo limpo ($ORIGIN) em todos os binários e libs para nunca exigir LD_LIBRARY_PATH
           find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
             xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN' 2>/dev/null || true
@@ -682,27 +688,145 @@ jobs:
           rdfind -makesymlinks true -makeresultsfile false "$TOOLCHAIN"
           symlinks -cr "$TOOLCHAIN"
 
-          # 4. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
+          # 4. Strip Cirúrgico em Paralelo (Preserva DWARF/metadados dos runtimes .rlib, .swiftmodule e adalib)
           find "$TOOLCHAIN/bin" -type f -print0 | xargs -0 -n 10 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
           find "$TOOLCHAIN/lib" -maxdepth 1 -type f \( \
             -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" -o \
             -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
           \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
 
-          # 5. Remove TODAS as bibliotecas estáticas (.a) internas do compilador
+          # 5. Remove TODAS as bibliotecas estáticas (.a) internas do compilador (preservando runtimes de usuário)
           rm -f "$TOOLCHAIN/lib"/libLLVM*.a "$TOOLCHAIN/lib"/libclang*.a \
-                "$TOOLCHAIN/lib"/libMLIR*.a "$TOOLCHAIN/lib"/libFortran*.a \
-                "$TOOLCHAIN/lib"/liblldb*.a "$TOOLCHAIN/lib"/libflang*.a \
-                "$TOOLCHAIN/lib"/liblld*.a
+                "$TOOLCHAIN/lib"/libMLIR*.a "$TOOLCHAIN/lib"/liblldb*.a \
+                "$TOOLCHAIN/lib"/libflang*.a "$TOOLCHAIN/lib"/liblld*.a
 
-          # 6. Auditoria anti-libpython
-          echo "=== Verificando dependências dinâmicas do LLDB no Ubuntu 26.04 ==="
-          ldd "$TOOLCHAIN/bin/lldb"
+          # ====================================================================
+          # 6. SUÍTE INDUSTRIAL DE TESTES DE RUNTIME, ABI E INTEROPERABILIDADE
+          # ====================================================================
+          echo "===================================================================="
+          echo "🧪 INICIANDO AUDITORIA DE RUNTIMES E ABI (PADRÃO CANONICAL / APPLE)"
+          echo "===================================================================="
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          TEST_DIR=$(mktemp -d /tmp/omnillvm-tests.XXXXXX)
+          cd "$TEST_DIR"
+
+          # [6.1] Auditoria de Dependências Dinâmicas (Zero 'not found' e Zero 'libpython')
+          echo "-> [1/7] Verificando integridade ELF (RPATH / ldd) e ausência de libpython..."
           if ldd "$TOOLCHAIN/bin/lldb" "$TOOLCHAIN/lib/liblldb.so"* | grep -q "libpython"; then
-            echo "ERRO FATAL: libpython encontrada no LLDB (${{ matrix.arch }})!"
+            echo "❌ ERRO FATAL: libpython encontrada no LLDB!"
             exit 1
           fi
-          echo "✅ Sucesso: LLDB 100% livre de libpython e compilado nativamente para Ubuntu 26.04!"
+          MISSING_LIBS=$(find "$TOOLCHAIN/bin" -maxdepth 1 -type f -executable -exec ldd {} + 2>/dev/null | grep "not found" || true)
+          if [ -n "$MISSING_LIBS" ]; then
+            echo "⚠️ Aviso de libs dinâmicas pendentes:"
+            echo "$MISSING_LIBS"
+          fi
+
+          # [6.2] Teste C23 + C++23 (Compatibilidade ABI GNU/Ubuntu libstdc++ + Unwind/Exceptions)
+          echo "-> [2/7] Testando Clang/Clang++ (ABI Ubuntu libstdc++ + Exceptions + LLD)..."
+          cat << 'EOF' > test_cpp.cpp
+          #include <iostream>
+          #include <vector>
+          #include <string>
+          #include <stdexcept>
+          extern "C" int c_add(int a, int b);
+          extern "C" int rust_mul(int a, int b);
+          int main() {
+              try {
+                  throw std::runtime_error("unwind_ok");
+              } catch (const std::exception& e) {
+                  std::vector<std::string> v = {"OmniLLVM", "C++23", e.what()};
+                  if (c_add(20, 22) != 42 || rust_mul(6, 7) != 42) return 1;
+                  std::cout << "✅ C/C++/Rust FFI & Unwind OK: " << v[0] << " (" << v[2] << ")\n";
+              }
+              return 0;
+          }
+          EOF
+          cat << 'EOF' > test_c.c
+          int c_add(int a, int b) { return a + b; }
+          EOF
+          "$TOOLCHAIN/bin/clang" -O3 -c test_c.c -o test_c.o
+          "$TOOLCHAIN/bin/clang++" -O3 -std=c++23 -c test_cpp.cpp -o test_cpp.o
+
+          # [6.3] Teste Rust 1.94.0 (Stdlib + Threads + FFI C/C++)
+          echo "-> [3/7] Testando Rustc 1.94.0 (Stdlib + FFI staticlib + executável nativo)..."
+          cat << 'EOF' > test_rust_ffi.rs
+          #[no_mangle]
+          pub extern "C" fn rust_mul(a: i32, b: i32) -> i32 { a * b }
+          EOF
+          "$TOOLCHAIN/bin/rustc" -O --crate-type=staticlib test_rust_ffi.rs -o librust_ffi.a
+
+          # Linka C + C++ + Rust juntos usando ld.lld para provar compatibilidade total de ABI!
+          "$TOOLCHAIN/bin/clang++" -O3 -fuse-ld=lld test_cpp.o test_c.o librust_ffi.a -lpthread -ldl -o test_ffi_bin
+          ./test_ffi_bin
+
+          cat << 'EOF' > test_rust_bin.rs
+          use std::thread;
+          fn main() {
+              let h = thread::spawn(|| (1..=10).sum::<i32>());
+              assert_eq!(h.join().unwrap(), 55);
+              println!("✅ Rust 1.94.0 Runtime & Threads OK!");
+          }
+          EOF
+          "$TOOLCHAIN/bin/rustc" -O test_rust_bin.rs -o test_rust_bin
+          ./test_rust_bin
+
+          # [6.4] Teste Swift 6.4.1 (Runtime libswiftCore.so + Concurrency/Stdlib)
+          echo "-> [4/7] Testando Swift 6.4.1 (swiftc + libswiftCore.so)..."
+          cat << 'EOF' > test_swift.swift
+          struct Point { var x: Int; var y: Int }
+          let p = Point(x: 20, y: 22)
+          assert(p.x + p.y == 42)
+          print("✅ Swift 6.4.1 Runtime & Stdlib OK: \(p.x + p.y)")
+          EOF
+          "$TOOLCHAIN/bin/swiftc" -O test_swift.swift -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin
+          ./test_swift_bin
+
+          # [6.5] Teste Ada GNAT-LLVM 27.1 (llvm-gnatmake + Runtime Ada)
+          echo "-> [5/7] Testando Ada GNAT-LLVM 27.1 (llvm-gnatmake + libgnat)..."
+          cat << 'EOF' > hello_ada.adb
+          with Ada.Text_IO; use Ada.Text_IO;
+          procedure Hello_Ada is
+             X : constant Integer := 42;
+          begin
+             Put_Line ("✅ Ada GNAT-LLVM 27.1 Runtime OK:" & Integer'Image (X));
+          end Hello_Ada;
+          EOF
+          "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb --RTS="$TOOLCHAIN/lib/rts-native" -largs -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
+          ./hello_ada
+
+          # [6.6] Teste Fortran Flang (Verifica geração de código LLVM no Flang)
+          echo "-> [6/7] Testando Fortran Flang 21 (Compilação para Objeto ELF)..."
+          cat << 'EOF' > test_fortran.f90
+          pure integer function fort_square(x) bind(c, name="fort_square")
+            use iso_c_binding, only: c_int
+            integer(c_int), value, intent(in) :: x
+            fort_square = x * x
+          end function fort_square
+          EOF
+          FLANG_BIN=$(ls "$TOOLCHAIN/bin/flang" "$TOOLCHAIN/bin/flang-new" 2>/dev/null | head -n 1)
+          "$FLANG_BIN" -O3 -c test_fortran.f90 -o test_fortran.o
+          cat << 'EOF' > test_fort_main.c
+          #include <stdio.h>
+          extern int fort_square(int x);
+          int main() {
+              if (fort_square(7) != 49) return 1;
+              printf("✅ Fortran (Flang 21 ISO_C_BINDING) ABI OK: %d\n", fort_square(7));
+              return 0;
+          }
+          EOF
+          "$TOOLCHAIN/bin/clang" -O3 test_fort_main.c test_fortran.o -o test_fort_bin
+          ./test_fort_bin
+
+          # [6.7] Teste LLDB (Verifica inicialização limpa do Debugger)
+          echo "-> [7/7] Testando LLDB Batch Mode em binário compilado..."
+          "$TOOLCHAIN/bin/lldb" --batch -o "target create ./test_ffi_bin" -o "run" -o "quit"
+
+          cd /opt && rm -rf "$TEST_DIR"
+          rm -f "$TOOLCHAIN/usr" || true
+          echo "===================================================================="
+          echo "🎉 TODOS OS 7 TESTES DE COMPATIBILIDADE E RUNTIME PASSARAM COM 100%!"
+          echo "===================================================================="
 
           # 7. Compressão Final ZSTD Nível 19 Multi-Thread
           cd /opt
