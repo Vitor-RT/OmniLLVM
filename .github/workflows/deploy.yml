@@ -41,18 +41,19 @@ permissions:
 env:
   INSTALL_PREFIX: /opt/omnillvm
   # ==========================================================================
-  # TODAS AS VERSÕES FIXADAS EM BRANCHES/TAGS DE RELEASE ESTÁVEIS (LLVM 21)
+  # VERSÕES OFICIAIS ESTÁVEIS FIXADAS:
+  # Swift 6.4.1 + LLVM 21 (swift/release/6.4.1) | Rust 1.94.0 | GNAT 27.1
   # ==========================================================================
-  SWIFT_BRANCH: release/6.4.2
-  SWIFT_LLVM_BRANCH: swift/release/6.4.2
+  SWIFT_SCHEME: release/6.4.1
+  SWIFT_LLVM_BRANCH: swift/release/6.4.1
   SWIFT_BOOTSTRAP_VER: 6.0.3
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-15
-  # Revisões de Cache por Estágio
-  CORE_CACHE_REV: v4-642
-  FRONTEND_CACHE_REV: v3-r194-g271
-  PACKAGE_CACHE_REV: v2
+  # Novas chaves limpas para a versão 6.4.1
+  CORE_CACHE_REV: v1-swift641
+  FRONTEND_CACHE_REV: v1-swift641-r194-g271
+  PACKAGE_CACHE_REV: v1-swift641
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -66,7 +67,7 @@ jobs:
   # ESTÁGIO 1: Core em Container Ubuntu 26.04 (AMD64 + ARM64)
   # ============================================================================
   build-core:
-    name: "Stage 1: Core LLVM+Swift [Ubuntu 26.04 - ${{ matrix.arch }}]"
+    name: "Stage 1: Core LLVM+Swift 6.4.1 [Ubuntu 26.04 - ${{ matrix.arch }}]"
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
@@ -97,7 +98,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 0B. Restaurar Cache do Core SDK Pronto (Stage 1)
+      - name: 0B. Restaurar Cache do Core SDK Pronto (Stage 1 - 6.4.1)
         id: core-cache
         if: inputs.rebuild_core != 'true'
         uses: actions/cache/restore@v4
@@ -149,46 +150,53 @@ jobs:
         if: steps.core-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: omnillvm-u2604-core-${{ matrix.arch }}
+          key: omnillvm-u2604-core-641-${{ matrix.arch }}
           restore-keys: |
+            omnillvm-u2604-core-641-${{ matrix.arch }}
             omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
 
-      - name: 3. Clonar Swift + LLVM 21 (swift/release/6.4.2) em Paralelo
+      - name: 3. Clonar Swift 6.4.1 + LLVM 21 (swift/release/6.4.1) Sem Conflito de Merge
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
 
-          # Resolve automaticamente a branch/scheme no swiftlang/swift (release/6.4.2 -> release/6.4.x -> release/6.3)
-          if git ls-remote --exit-code --heads https://github.com/swiftlang/swift.git "${{ env.SWIFT_BRANCH }}" >/dev/null 2>&1; then
-            RESOLVED_SWIFT="${{ env.SWIFT_BRANCH }}"
-          elif git ls-remote --exit-code --heads https://github.com/swiftlang/swift.git "release/6.4.x" >/dev/null 2>&1; then
-            RESOLVED_SWIFT="release/6.4.x"
+          # Clona o repositório swift na branch release/6.4.1 (ou release/6.4 se swift principal usar nome curto)
+          if git ls-remote --exit-code --heads https://github.com/swiftlang/swift.git "${{ env.SWIFT_SCHEME }}" >/dev/null 2>&1; then
+            SWIFT_GIT_BRANCH="${{ env.SWIFT_SCHEME }}"
           else
-            RESOLVED_SWIFT="release/6.3"
+            SWIFT_GIT_BRANCH="release/6.4"
           fi
-          echo "Usando branch do Swift: $RESOLVED_SWIFT"
-          git clone --branch "$RESOLVED_SWIFT" --depth 1 --single-branch https://github.com/swiftlang/swift.git
+          echo "Clonando swiftlang/swift na branch: $SWIFT_GIT_BRANCH"
+          git clone --branch "$SWIFT_GIT_BRANCH" --depth 1 --single-branch https://github.com/swiftlang/swift.git
 
-          # Verifica se o scheme exato existe no update-checkout-config.json; se não, usa o scheme pai e trava llvm-project em swift/release/6.4.2
-          if grep -q "\"$RESOLVED_SWIFT\"" swift/utils/update-checkout-config.json; then
-            SCHEME="$RESOLVED_SWIFT"
-          elif grep -q "\"release/6.4\"" swift/utils/update-checkout-config.json; then
-            SCHEME="release/6.4"
-          else
-            SCHEME="release/6.3"
-          fi
-          ./swift/utils/update-checkout --clone --scheme "$SCHEME" --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
+          # Registra o scheme exato no update-checkout-config.json alinhado com SWIFT_GIT_BRANCH e swift/release/6.4.1
+          # Isso impede que o update-checkout tente fazer rebase/merge na pasta swift já clonada!
+          python3 - <<EOF
+          import json
+          cfg_path = "swift/utils/update-checkout-config.json"
+          with open(cfg_path, "r") as f:
+              data = json.load(f)
+          schemes = data.get("branch-schemes", {})
+          base_scheme = "release/6.4.1" if "release/6.4.1" in schemes else ("release/6.4" if "release/6.4" in schemes else "release/6.3")
+          import copy
+          new_scheme = copy.deepcopy(schemes[base_scheme])
+          new_scheme["repos"]["swift"] = "$SWIFT_GIT_BRANCH"
+          new_scheme["repos"]["llvm-project"] = "${{ env.SWIFT_LLVM_BRANCH }}"
+          schemes["${{ env.SWIFT_SCHEME }}"] = new_scheme
+          with open(cfg_path, "w") as f:
+              json.dump(data, f, indent=2)
+          print(f"Scheme '${{ env.SWIFT_SCHEME }}' configurado com sucesso (base: {base_scheme}) -> llvm-project: ${{ env.SWIFT_LLVM_BRANCH }}")
+          EOF
 
-          # Garante que o llvm-project esteja exatamente na branch estável swift/release/6.4.2 pedida
-          if git ls-remote --exit-code --heads https://github.com/swiftlang/llvm-project.git "${{ env.SWIFT_LLVM_BRANCH }}" >/dev/null 2>&1; then
-            echo "Sincronizando llvm-project com ${{ env.SWIFT_LLVM_BRANCH }}..."
-            cd $GITHUB_WORKSPACE/src/llvm-project
-            git fetch --depth 1 origin "${{ env.SWIFT_LLVM_BRANCH }}"
-            git checkout -f FETCH_HEAD
-          fi
+          # Faz commit local do config para que o update-checkout veja a árvore limpa e pule o merge do swift
+          git -C swift config user.email "builder@omnillvm.local"
+          git -C swift config user.name "OmniLLVM Builder"
+          git -C swift commit -am "Lock scheme ${{ env.SWIFT_SCHEME }}" || true
 
-      - name: 4. Compilar Core com Otimização Máxima (-O3 + --no-assertions + libLLVM.so Nativa)
+          ./swift/utils/update-checkout --clone --scheme "${{ env.SWIFT_SCHEME }}" --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
+
+      - name: 4. Compilar Core 6.4.1 com Otimização Máxima (-O3 + --no-assertions + libLLVM.so Nativa)
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           cd $GITHUB_WORKSPACE/src
@@ -355,7 +363,6 @@ jobs:
           key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
           restore-keys: |
             omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
-            omnillvm-overlay-tarball-v2-${{ matrix.component }}-${{ matrix.arch }}
 
       - name: 1. Baixar Core SDK (${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
@@ -397,12 +404,13 @@ jobs:
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
+          key: omnillvm-u2604-641-${{ matrix.component }}-${{ matrix.arch }}
           restore-keys: |
+            omnillvm-u2604-641-${{ matrix.component }}-${{ matrix.arch }}
             omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
           max-size: 2G
 
-      # --- 3A. Flang + MLIR Dinâmicos (-O3 + mold) [swift/release/6.4.2] ---
+      # --- 3A. Flang + MLIR Dinâmicos (-O3 + mold) [swift/release/6.4.1] ---
       - name: 3A. Compilar Flang + MLIR Dinâmicos (-O3)
         if: matrix.component == 'flang-mlir' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
@@ -494,7 +502,6 @@ jobs:
           export TMPDIR="/tmp"
 
           mkdir -p $GITHUB_WORKSPACE/ada && cd $GITHUB_WORKSPACE/ada
-          # Usa a branch de release ESTÁVEL release/27.1 (feita para o LLVM 21!)
           git clone --depth 1 --branch ${{ env.GNAT_LLVM_BRANCH }} https://github.com/AdaCore/gnat-llvm.git
           cd gnat-llvm
           if git ls-remote --exit-code --heads https://github.com/AdaCore/llvm-bindings.git "${{ env.GNAT_LLVM_BRANCH }}" >/dev/null 2>&1; then
@@ -503,12 +510,10 @@ jobs:
             git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
           fi
 
-          # Clona apenas o diretório gcc/ada na branch estável releases/gcc-15
           git clone --filter=blob:none --no-checkout --depth 1 --branch ${{ env.GCC_ADA_BRANCH }} https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
           cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
-          # Garante visibilidade do operador System.CRTL.long em procedure Gnatlink
           sed -i 's/^procedure Gnatlink is/with System.CRTL; use System.CRTL;\nprocedure Gnatlink is\n   use type System.CRTL.long;/' \
             llvm-interface/gnat_src/gnatlink.adb || true
 
@@ -542,7 +547,6 @@ jobs:
           git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
           cd rust
 
-          # Se o LLVM 21 do Swift tiver PGOOptions sem o argumento FS, ajusta automaticamente
           if ! grep -q "FileSystem" "${{ env.INSTALL_PREFIX }}/include/llvm/Support/PGOOptions.h"; then
             sed -i 's/"", "", "", FS,/"", "", "",/g' compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp || true
           fi
