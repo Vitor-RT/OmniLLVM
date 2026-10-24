@@ -45,7 +45,7 @@ env:
   SWIFT_BOOTSTRAP_VER: 6.0.3
   RUST_BRANCH: 1.91.0
   GCC_ADA_BRANCH: releases/gcc-14
-  # Chaves de revisão de cache (sem caracteres especiais como '/')
+  # Mantidos v3 e v2 para reaproveitar todos os caches que acabaram de ser salvos!
   CORE_CACHE_REV: v3
   FRONTEND_CACHE_REV: v2
   PACKAGE_CACHE_REV: v1
@@ -84,7 +84,6 @@ jobs:
             swift_dir_arch: "-aarch64"
 
     steps:
-      # Garante que 'zstd' exista no container ANTES do actions/cache/restore rodar!
       - name: 0A. Preparar ZSTD para o Cache do GitHub no Ubuntu 26.04
         run: |
           apt-get update -qq
@@ -171,8 +170,6 @@ jobs:
 
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN"
 
-          # Ativa LLVM_ENABLE_DYLIB=1 nativamente na fonte C++ do llvm-config para que --link-shared
-          # sempre aponte para a libLLVM.so monolítica sem nunca procurar 80 .so separados!
           sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
             $GITHUB_WORKSPACE/src/llvm-project/llvm/tools/llvm-config/llvm-config.cpp
 
@@ -226,11 +223,9 @@ jobs:
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
 
-          # Garante BuildVariables.inc com LLVM_ENABLE_DYLIB 1 no binário llvm-config
           sed -i 's/#define LLVM_ENABLE_DYLIB 0/#define LLVM_ENABLE_DYLIB 1/g' \
             "$LLVM_BUILD_DIR/tools/llvm-config/BuildVariables.inc" || true
 
-          # Compila e instala enquanto /opt/swift-bootstrap ainda existe (evita erro de swiftrt.o missing!)
           ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp FileCheck llvm-config
           DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR" install
           if [ -n "$SWIFT_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$SWIFT_BUILD_DIR" install || true; fi
@@ -262,7 +257,6 @@ jobs:
 
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
 
-          # Verifica que o binário nativo llvm-config responde -lLLVM-21 com --link-shared!
           "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs x86 aarch64 riscv
           ls -la "${{ env.INSTALL_PREFIX }}/bin/clang" "${{ env.INSTALL_PREFIX }}/bin/llvm-config" "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
 
@@ -272,7 +266,6 @@ jobs:
           cd /opt
           tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/core-sdk-${{ matrix.arch }}.tar.zst omnillvm
 
-      # SALVA EXPLICITAMENTE O CACHE DO STAGE 1 ANTES DE TERMINAR O JOB!
       - name: 6. Salvar Cache do Core SDK Pronto (Stage 1 - ${{ matrix.arch }})
         if: steps.core-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -320,7 +313,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # RESTAURA O CACHE DO COMPONENTE DO STAGE 2 (ex: flang-mlir já salvo!)
       - name: 0B. Restaurar Cache do Overlay Pronto (${{ matrix.component }}-${{ matrix.arch }})
         id: overlay-cache
         if: inputs.rebuild_frontends != 'true'
@@ -365,7 +357,6 @@ jobs:
           fi
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
 
-          # Valida que o llvm-config nativo responde -lLLVM-21 com --link-shared
           "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
 
       - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
@@ -449,6 +440,16 @@ jobs:
           ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
           ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
 
+          # Garante que os symlinks sem sufixo (libLLVM.so e libclang-cpp.so) existam em /opt/omnillvm/lib
+          LLVM_SO=$(ls "${{ env.INSTALL_PREFIX }}/lib/"libLLVM-*.so "${{ env.INSTALL_PREFIX }}/lib/"libLLVM.so.* 2>/dev/null | head -n 1)
+          if [ -n "$LLVM_SO" ] && [ ! -e "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so" ]; then
+            ln -sf "$(basename "$LLVM_SO")" "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so"
+          fi
+          CLANG_CPP_SO=$(ls "${{ env.INSTALL_PREFIX }}/lib/"libclang-cpp.so.* 2>/dev/null | head -n 1)
+          if [ -n "$CLANG_CPP_SO" ] && [ ! -e "${{ env.INSTALL_PREFIX }}/lib/libclang-cpp.so" ]; then
+            ln -sf "$(basename "$CLANG_CPP_SO")" "${{ env.INSTALL_PREFIX }}/lib/libclang-cpp.so"
+          fi
+
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
           export TMPDIR="/tmp"
@@ -462,11 +463,13 @@ jobs:
           cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
 
+          # CORREÇÃO: Usa apenas --link-shared no Makefile (que já injeta -L/opt/omnillvm/lib -lLLVM-21)
+          # e substitui -lclangBasic por -lclang-cpp (sem espaço dentro das aspas do .gpr!)
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
-          sed -i 's/-lclangBasic/-lclang-cpp -lLLVM/g' llvm-interface/gnat_llvm.gpr llvm-interface/Makefile 2>/dev/null || true
+          sed -i 's/"-lclangBasic"/"-lclang-cpp"/g' llvm-interface/gnat_llvm.gpr 2>/dev/null || true
 
           if ! make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lLLVM -lclang-cpp" \
+            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lclang-cpp" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
             build; then
@@ -476,7 +479,7 @@ jobs:
             cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
             ln -s gcc/gcc/ada llvm-interface/gnat_src
             make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-              GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lLLVM -lclang-cpp" \
+              GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lclang-cpp" \
               LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
               PREFIX="/opt/overlay-install" \
               build
@@ -556,7 +559,6 @@ jobs:
           cd /opt/overlay-install
           tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst .
 
-      # SALVA EXPLICITAMENTE O CACHE DO COMPONENTE DO STAGE 2 ANTES DE TERMINAR O JOB!
       - name: 5. Salvar Cache do Overlay Pronto (${{ matrix.component }}-${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -672,7 +674,6 @@ jobs:
           cd /opt
           tar -I "zstd -19 -T0" -cf $GITHUB_WORKSPACE/omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst omnillvm
 
-      # SALVA EXPLICITAMENTE O CACHE DO PACOTE FINAL DO STAGE 3!
       - name: Salvar Cache do Pacote Final (Stage 3 - ${{ matrix.arch }})
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
