@@ -182,6 +182,8 @@ jobs:
           sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
             $GITHUB_WORKSPACE/src/llvm-project/llvm/tools/llvm-config/llvm-config.cpp
 
+          # CORREÇÃO: Removido '-fuse-ld=lld' de CMAKE_SHARED_LINKER_FLAGS (pois swiftc ao linkar libswiftDispatch.so
+          # não aceita a flag '-fuse-ld=lld' do clang, e /usr/bin/ld já aponta nativamente para /usr/bin/ld.lld!)
           ./swift/utils/build-script \
             --release \
             --no-assertions \
@@ -201,9 +203,9 @@ jobs:
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
               -DCMAKE_CXX_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
-              -DCMAKE_SHARED_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
-              -DCMAKE_MODULE_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
-              -DCMAKE_EXE_LINKER_FLAGS='-fuse-ld=lld -Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
+              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
+              -DCMAKE_MODULE_LINKER_FLAGS='-Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
+              -DCMAKE_EXE_LINKER_FLAGS='-Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
               -DCMAKE_INSTALL_RPATH='${BUILD_RPATH}' \
               -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
@@ -277,7 +279,7 @@ jobs:
           cp -ru "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" 2>/dev/null || true
           cp -ru "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" 2>/dev/null || true
 
-          # Garante que todas as .so compiladas em lib/swift (incluindo libdispatch.so e lib_CompilerSwift*.so)
+          # Garante que todas as .so compiladas em lib/swift (incluindo libdispatch.so, libswiftDispatch.so e lib_CompilerSwift*.so)
           # tenham symlink direto em /opt/omnillvm/lib/
           find "${{ env.INSTALL_PREFIX }}/lib/swift" -name "*.so*" 2>/dev/null | while read -r f; do
             if [ ! -e "${{ env.INSTALL_PREFIX }}/lib/$(basename "$f")" ]; then
@@ -897,10 +899,11 @@ jobs:
           # [4/7] Teste Swift 6.4.1 (swiftc + libswiftCore.so + libdispatch.so + clang/lld)
           echo "-> [4/7] Testando Swift 6.4.1 (swiftc + libswiftCore.so + libdispatch.so)..."
           cat << 'EOF' > test_swift.swift
+          import Dispatch
           struct Point { var x: Int; var y: Int }
           let p = Point(x: 20, y: 22)
           assert(p.x + p.y == 42)
-          print("✅ [4/7] Swift 6.4.1 Runtime & Stdlib OK: \(p.x + p.y)")
+          print("✅ [4/7] Swift 6.4.1 Runtime, Stdlib & libdispatch OK: \(p.x + p.y)")
           EOF
           "$TOOLCHAIN/bin/swiftc" -O -use-ld=lld test_swift.swift -L"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin
           ./test_swift_bin
