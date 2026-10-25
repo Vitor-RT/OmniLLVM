@@ -54,7 +54,7 @@ env:
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
   ADA_CACHE_REV: v3-single-llvm-passregistry
-  PACKAGE_CACHE_REV: v10-ada-default-rts
+  PACKAGE_CACHE_REV: v11-libunwind-ldscript
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -670,7 +670,7 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar (100% Swift-LLVM Runtimes), Configurar RTS Padrão do Ada e Eliminar -latomic
+      - name: 1. Unificar (100% Swift-LLVM Runtimes), Configurar RTS Padrão do Ada e Linker Scripts
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev
@@ -695,9 +695,6 @@ jobs:
                  "$TOOLCHAIN/share/man" \
                  "$TOOLCHAIN/share/info" 2>/dev/null || true
 
-          # CORREÇÃO DEFINITIVA DO ADA RTS ("cannot locate file system.ads"):
-          # 1. Atualiza o cabeçalho dos arquivos .ali de v15 para v16
-          # 2. Coloca links de adainclude e adalib em todos os caminhos padrão onde o sdefault.adb do llvm-gnat1 procura!
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
             sed -i '1s/GNAT Lib v15/GNAT Lib v16/' "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
@@ -750,11 +747,16 @@ jobs:
           find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" ! -name "libatomic.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
           if [ -e "$TOOLCHAIN/lib/libunwind.so" ]; then
             echo "GROUP ( libunwind.so.1 libgcc.a -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
+            # CORREÇÃO DEFINITIVA DE "ld.lld: error: unable to find library -l:libunwind.a":
+            # Quando ferramentas como llvm-gnatlink passam '-static-libgcc' para o Clang configurado com
+            # '--unwindlib=libunwind', o Clang traduz para '-l:libunwind.a'. Este Linker Script de 24 bytes
+            # resolve '-l:libunwind.a' apontando para libunwind.so.1!
+            echo "INPUT ( libunwind.so.1 )" > "$TOOLCHAIN/lib/libunwind.a"
           fi
 
           FAKE_GCC_DIR="$TOOLCHAIN/lib/gcc/${{ matrix.gnu_triple }}/15"
           mkdir -p "$FAKE_GCC_DIR"
-          for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so libatomic.so.1; do
+          for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libunwind.a libatomic.a libatomic.so libatomic.so.1; do
             [ -e "$TOOLCHAIN/lib/$item" ] && ln -sf "$TOOLCHAIN/lib/$item" "$FAKE_GCC_DIR/$item"
           done
           ln -sfn "$TOOLCHAIN/lib/rts-native/adainclude" "$FAKE_GCC_DIR/adainclude"
@@ -803,7 +805,7 @@ jobs:
 
           MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
           if [ -d "/opt/omnillvm/lib" ]; then
-            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so libatomic.so.1; do
+            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libunwind.a libatomic.a libatomic.so libatomic.so.1; do
               if [ -e "/opt/omnillvm/lib/$item" ] && [ ! -e "/usr/lib/$MULTIARCH/$item" ]; then
                 $SUDO ln -sf "/opt/omnillvm/lib/$item" "/usr/lib/$MULTIARCH/$item" 2>/dev/null || true
               fi
@@ -1081,7 +1083,7 @@ jobs:
 
           MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
           if [ -d "/opt/omnillvm/lib" ]; then
-            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so libatomic.so.1; do
+            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libunwind.a libatomic.a libatomic.so libatomic.so.1; do
               if [ -e "/opt/omnillvm/lib/$item" ] && [ ! -e "/usr/lib/$MULTIARCH/$item" ]; then
                 $SUDO ln -sf "/opt/omnillvm/lib/$item" "/usr/lib/$MULTIARCH/$item" 2>/dev/null || true
               fi
