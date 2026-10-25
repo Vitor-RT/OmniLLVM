@@ -122,7 +122,6 @@ jobs:
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
 
-          # Mantém /usr/bin/ld.lld como o binário nativo original (sem wrapper recursivo!)
           ln -sf /usr/bin/ld.lld /usr/bin/ld
           ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
           ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
@@ -183,11 +182,11 @@ jobs:
           sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
             $GITHUB_WORKSPACE/src/llvm-project/llvm/tools/llvm-config/llvm-config.cpp
 
-          # 2. Adiciona -Wl,--undefined-version especificamente nos targets CMake que usam --version-script (como IndexStore)
-          # Assim o ld.lld aceita o IndexStore.exports sem poluir a linha de comando do swiftc no libdispatch!
+          # 2. CORREÇÃO: Usa vírgula (-Wl,--undefined-version,--version-script) sem espaço!
+          # Assim funciona mesmo quando o CMake envolve a flag inteira entre aspas duplas em libclang.so e libIndexStore.so!
           find $GITHUB_WORKSPACE/src/llvm-project -name "CMakeLists.txt" -o -name "*.cmake" | \
             xargs grep -l "version-script" 2>/dev/null | \
-            xargs sed -i 's/-Wl,--version-script/-Wl,--undefined-version -Wl,--version-script/g; s/--version-script=/--undefined-version,--version-script=/g' 2>/dev/null || true
+            xargs sed -i 's/-Wl,--version-script/-Wl,--undefined-version,--version-script/g' 2>/dev/null || true
 
           ./swift/utils/build-script \
             --release \
