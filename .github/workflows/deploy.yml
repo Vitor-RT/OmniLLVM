@@ -50,11 +50,11 @@ env:
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
-  # Mantidos os caches de Stage 1, Flang e Rust! Apenas gnat-ada atualiza para v3!
+  # Mantidos TODOS os caches do Stage 1 e Stage 2 (pula tudo em ~20s direto para o Stage 3!)
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
   ADA_CACHE_REV: v3-single-llvm-passregistry
-  PACKAGE_CACHE_REV: v7-all-tests-green
+  PACKAGE_CACHE_REV: v8-ada-ali-v16
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -352,7 +352,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Flang e Rust usam o cache v2-clean já salvo; apenas gnat-ada usa a chave v3-single-llvm-passregistry!
       - name: 0B. Restaurar Cache do Overlay Pronto (${{ matrix.component }}-${{ matrix.arch }})
         id: overlay-cache
         if: inputs.rebuild_frontends != 'true'
@@ -517,10 +516,6 @@ jobs:
               f.write(txt)
           EOF
 
-          # CORREÇÃO DEFINITIVA DO ERRO "Corruption of the global PassRegistry / double free":
-          # NUNCA linkar libclang-cpp.so junto com libLLVM-21.so no llvm-gnat1, pois libclang-cpp.so tem
-          # uma cópia estática interna do LLVM (criando 2 PassRegistries na mesma memória!).
-          # Mantemos o -lclangBasic estático original do gnat_llvm.gpr e linkamos APENAS contra a libLLVM-21.so!
           sed -i 's/"-Werror"/"-Wno-error"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/"-gnatg"/"-gnatg", "-gnatwn"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
@@ -536,6 +531,8 @@ jobs:
           ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
           ADA_INC_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adainclude/system.ads))
           cp -af "$ADA_LIB_DIR/"*.ali /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
+          # Alinha o cabeçalho de versão dos arquivos .ali do sistema (v15 -> v16) com o gnatvsn do llvm-gnat1/llvm-gnatbind!
+          sed -i '1s/GNAT Lib v15/GNAT Lib v16/' /opt/overlay-install/lib/rts-native/adalib/*.ali 2>/dev/null || true
           cp -af "$ADA_INC_DIR/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat.so
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat-${GNAT_VER}.so
@@ -674,7 +671,7 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar (100% Swift-LLVM Runtimes), Corrigir Driver swiftc e Eliminar -latomic
+      - name: 1. Unificar (100% Swift-LLVM Runtimes), Sincronizar .ali do Ada (v16) e Eliminar -latomic
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev
@@ -699,7 +696,10 @@ jobs:
                  "$TOOLCHAIN/share/man" \
                  "$TOOLCHAIN/share/info" 2>/dev/null || true
 
+          # CORREÇÃO DEFINITIVA DO ERRO: 'error: "system.ads" and "hello_ada.adb" compiled with different GNAT versions, v15 and v16'
+          # Atualiza o cabeçalho de versão na 1ª linha dos arquivos .ali de "GNAT Lib v15" para "GNAT Lib v16"
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
+            sed -i '1s/GNAT Lib v15/GNAT Lib v16/' "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
           fi
 
