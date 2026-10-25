@@ -54,7 +54,7 @@ env:
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
   ADA_CACHE_REV: v3-single-llvm-passregistry
-  PACKAGE_CACHE_REV: v9-ada-link-clean
+  PACKAGE_CACHE_REV: v10-ada-default-rts
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -670,7 +670,7 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar (100% Swift-LLVM Runtimes), Sincronizar .ali do Ada (v16) e Eliminar -latomic
+      - name: 1. Unificar (100% Swift-LLVM Runtimes), Configurar RTS Padrão do Ada e Eliminar -latomic
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev
@@ -695,9 +695,16 @@ jobs:
                  "$TOOLCHAIN/share/man" \
                  "$TOOLCHAIN/share/info" 2>/dev/null || true
 
+          # CORREÇÃO DEFINITIVA DO ADA RTS ("cannot locate file system.ads"):
+          # 1. Atualiza o cabeçalho dos arquivos .ali de v15 para v16
+          # 2. Coloca links de adainclude e adalib em todos os caminhos padrão onde o sdefault.adb do llvm-gnat1 procura!
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
             sed -i '1s/GNAT Lib v15/GNAT Lib v16/' "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
+            ln -sfn rts-native/adainclude "$TOOLCHAIN/lib/adainclude"
+            ln -sfn rts-native/adalib "$TOOLCHAIN/lib/adalib"
+            ln -sfn lib/rts-native/adainclude "$TOOLCHAIN/adainclude"
+            ln -sfn lib/rts-native/adalib "$TOOLCHAIN/adalib"
           fi
 
           if [ -x "$TOOLCHAIN/bin/swift-frontend" ] && ldd "$TOOLCHAIN/bin/swiftc" 2>/dev/null | grep -q "not found"; then
@@ -750,6 +757,8 @@ jobs:
           for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so libatomic.so.1; do
             [ -e "$TOOLCHAIN/lib/$item" ] && ln -sf "$TOOLCHAIN/lib/$item" "$FAKE_GCC_DIR/$item"
           done
+          ln -sfn "$TOOLCHAIN/lib/rts-native/adainclude" "$FAKE_GCC_DIR/adainclude"
+          ln -sfn "$TOOLCHAIN/lib/rts-native/adalib" "$FAKE_GCC_DIR/adalib"
 
           cat << 'EOF' > "$TOOLCHAIN/bin/clang.cfg"
           --rtlib=compiler-rt
@@ -827,6 +836,10 @@ jobs:
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat-15.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnarl.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnarl-15.so"
+            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/libgnat-15.so"
+            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/libgnat.so"
+            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/libgnarl-15.so"
+            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/libgnarl.so"
           fi
 
           # 8. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
@@ -950,9 +963,9 @@ jobs:
              Put_Line ("✅ [5/7] Ada GNAT-LLVM 27.1 Pure LLVM Runtime OK:" & Integer'Image (X));
           end Hello_Ada;
           EOF
-          # CORREÇÃO: Removido '-B' (que o llvm-gnatlink repassava ao llvm-gnat1 no arquivo de bind b~hello_ada.adb)
-          # e passado '--GCC=$TOOLCHAIN/bin/clang' para que a linkagem final use o Clang Pure LLVM!
-          "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb --RTS="$TOOLCHAIN/lib/rts-native" -largs --GCC="$TOOLCHAIN/bin/clang" -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
+          export ADA_INCLUDE_PATH="$TOOLCHAIN/lib/rts-native/adainclude"
+          export ADA_OBJECTS_PATH="$TOOLCHAIN/lib/rts-native/adalib"
+          "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb -largs -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
           ./hello_ada
 
           # [6/7] Teste Fortran Flang 21 (ISO_C_BINDING ABI com Clang Pure LLVM)
