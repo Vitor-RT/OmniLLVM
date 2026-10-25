@@ -122,6 +122,14 @@ jobs:
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
 
+          # Configura /usr/bin/ld.lld para passar '--undefined-version' nativamente no nível do linker!
+          # Assim libIndexStore.so (C++) tem '--undefined-version' garantido e libswiftDispatch.so (swiftc)
+          # não falha por flags '-Wl,--undefined-version' na linha de comando do swiftc!
+          cat << 'EOF' > /usr/bin/ld.lld
+          #!/bin/sh
+          exec /usr/bin/lld -flavor gnu --undefined-version "$@"
+          EOF
+          chmod +x /usr/bin/ld.lld
           ln -sf /usr/bin/ld.lld /usr/bin/ld
           ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
           ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
@@ -182,9 +190,6 @@ jobs:
           sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
             $GITHUB_WORKSPACE/src/llvm-project/llvm/tools/llvm-config/llvm-config.cpp
 
-          # CORREÇÃO: Removido CMAKE_SHARED_LINKER_FLAGS com '-Wl,...', pois o CMake do libdispatch
-          # repassa essas flags diretamente ao 'swiftc' (que não aceita '-Wl,...', apenas '-Xlinker').
-          # O RPATH já é configurado nativamente para C++ e Swift por CMAKE_INSTALL_RPATH + CMAKE_BUILD_WITH_INSTALL_RPATH=ON!
           ./swift/utils/build-script \
             --release \
             --no-assertions \
