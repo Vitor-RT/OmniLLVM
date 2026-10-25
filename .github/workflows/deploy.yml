@@ -182,8 +182,9 @@ jobs:
           sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
             $GITHUB_WORKSPACE/src/llvm-project/llvm/tools/llvm-config/llvm-config.cpp
 
-          # CORREÇÃO: Removido '-fuse-ld=lld' de CMAKE_SHARED_LINKER_FLAGS (pois swiftc ao linkar libswiftDispatch.so
-          # não aceita a flag '-fuse-ld=lld' do clang, e /usr/bin/ld já aponta nativamente para /usr/bin/ld.lld!)
+          # CORREÇÃO: Removido CMAKE_SHARED_LINKER_FLAGS com '-Wl,...', pois o CMake do libdispatch
+          # repassa essas flags diretamente ao 'swiftc' (que não aceita '-Wl,...', apenas '-Xlinker').
+          # O RPATH já é configurado nativamente para C++ e Swift por CMAKE_INSTALL_RPATH + CMAKE_BUILD_WITH_INSTALL_RPATH=ON!
           ./swift/utils/build-script \
             --release \
             --no-assertions \
@@ -203,9 +204,6 @@ jobs:
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
               -DCMAKE_CXX_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
-              -DCMAKE_SHARED_LINKER_FLAGS='-Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
-              -DCMAKE_MODULE_LINKER_FLAGS='-Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
-              -DCMAKE_EXE_LINKER_FLAGS='-Wl,--undefined-version -Wl,-rpath,${BUILD_RPATH}' \
               -DCMAKE_INSTALL_RPATH='${BUILD_RPATH}' \
               -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
