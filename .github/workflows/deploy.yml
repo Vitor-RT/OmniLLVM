@@ -53,7 +53,7 @@ env:
   # Mantidos os caches de compilação v2-clean do Stage 1 e Stage 2 (pula direto para o Stage 3!)
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
-  PACKAGE_CACHE_REV: v4-pure-llvm-crt
+  PACKAGE_CACHE_REV: v5-llvm-atomic-fix
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -669,10 +669,10 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar (100% Swift-LLVM Runtimes), Remover Dependência de libatomic/GCC e Aplicar Strip
+      - name: 1. Unificar (100% Swift-LLVM Runtimes), Eliminar -latomic do Linker Script libc++.so e Aplicar Strip
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils
+          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev
 
           CORES=$(nproc --all)
           mkdir -p /opt
@@ -713,8 +713,19 @@ jobs:
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc.a"
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc_eh.a"
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libatomic.a"
+              # Gera uma libatomic.so.1 ELF real (100% Pure LLVM a partir dos builtins do compiler-rt!)
+              "$TOOLCHAIN/bin/clang" -shared -fuse-ld=lld -nostdlib \
+                -Wl,-soname,libatomic.so.1 \
+                -Wl,--whole-archive "$BUILTINS_A" -Wl,--no-whole-archive \
+                -lc -o "$TOOLCHAIN/lib/libatomic.so.1"
+              ln -sf libatomic.so.1 "$TOOLCHAIN/lib/libatomic.so"
             fi
           fi
+
+          # CAUSA RAIZ DO ERRO "libatomic.so.1: cannot open shared object file":
+          # O arquivo libc++.so gerado pelo LLVM é um Linker Script de texto contendo: INPUT(libc++.so.1 -lc++abi -latomic)
+          # Removemos '-latomic' de todos os linker scripts libc++.so para que o linker nunca injete DT_NEEDED: libatomic.so.1!
+          find "$TOOLCHAIN/lib" -name "libc++.so" -type f -exec sed -i 's/-latomic//g' {} + 2>/dev/null || true
 
           find "$TOOLCHAIN/lib" -maxdepth 3 \( -name "libc++.so*" -o -name "libc++abi.so*" -o -name "libunwind.so*" \) | while read -r f; do
             if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ]; then
@@ -722,20 +733,16 @@ jobs:
             fi
           done
 
-          # Remove DT_NEEDED de libatomic.so.1 das libs da toolchain (como libc++.so.1)
-          # e cria linker scripts libatomic.so e libgcc_s.so apontando para compiler-rt e libunwind do LLVM!
-          find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
-          echo "GROUP ( libgcc.a -lc )" > "$TOOLCHAIN/lib/libatomic.so"
+          # Remove DT_NEEDED de libatomic.so.1 de qualquer .so binária da toolchain
+          find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" ! -name "libatomic.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
           if [ -e "$TOOLCHAIN/lib/libunwind.so" ]; then
             echo "GROUP ( libunwind.so.1 libgcc.a -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
           fi
 
           # Cria árvore de compatibilidade interna lib/gcc/<triple>/15 dentro de /opt/omnillvm
-          # para que swiftc, rustc e llvm-gnatlink encontrem crtbeginS.o, crtendS.o, libgcc.a e libgcc_s.so
-          # mesmo quando nenhum pacote do GCC estiver instalado no Ubuntu!
           FAKE_GCC_DIR="$TOOLCHAIN/lib/gcc/${{ matrix.gnu_triple }}/15"
           mkdir -p "$FAKE_GCC_DIR"
-          for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so; do
+          for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so libatomic.so.1; do
             [ -e "$TOOLCHAIN/lib/$item" ] && ln -sf "$TOOLCHAIN/lib/$item" "$FAKE_GCC_DIR/$item"
           done
 
@@ -758,8 +765,7 @@ jobs:
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
 
-          # 4. Gera o script install-ubuntu26.04-deps.sh que instala apenas as libs de SO do Ubuntu 26.04
-          # e expõe os symlinks do compiler-rt/libunwind do OmniLLVM em /usr/lib/<triple> (Zero GCC necessário!)
+          # 4. Gera o script install-ubuntu26.04-deps.sh com pacotes 100% existentes no Ubuntu 26.04!
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
           set -euo pipefail
@@ -781,11 +787,9 @@ jobs:
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
 
-          # Se /opt/omnillvm existir e o sistema não tiver libgcc-dev instalado,
-          # cria symlinks em /usr/lib/<multiarch> apontando crtbeginS.o/libgcc.a para o compiler-rt do OmniLLVM!
           MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
           if [ -d "/opt/omnillvm/lib" ]; then
-            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so; do
+            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so libatomic.so.1; do
               if [ -e "/opt/omnillvm/lib/$item" ] && [ ! -e "/usr/lib/$MULTIARCH/$item" ]; then
                 $SUDO ln -sf "/opt/omnillvm/lib/$item" "/usr/lib/$MULTIARCH/$item" 2>/dev/null || true
               fi
@@ -1057,7 +1061,7 @@ jobs:
 
           MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
           if [ -d "/opt/omnillvm/lib" ]; then
-            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so; do
+            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so libatomic.so.1; do
               if [ -e "/opt/omnillvm/lib/$item" ] && [ ! -e "/usr/lib/$MULTIARCH/$item" ]; then
                 $SUDO ln -sf "/opt/omnillvm/lib/$item" "/usr/lib/$MULTIARCH/$item" 2>/dev/null || true
               fi
