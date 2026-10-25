@@ -50,10 +50,11 @@ env:
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
-  # Mantidos os caches de compilação v2-clean do Stage 1 e Stage 2 (pula direto para o Stage 3!)
+  # Mantidos os caches de Stage 1, Flang e Rust! Apenas gnat-ada atualiza para v3!
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
-  PACKAGE_CACHE_REV: v6-swiftc-driver-fix
+  ADA_CACHE_REV: v3-single-llvm-passregistry
+  PACKAGE_CACHE_REV: v7-all-tests-green
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -267,7 +268,6 @@ jobs:
           done
 
           mkdir -p "${{ env.INSTALL_PREFIX }}/bin" "${{ env.INSTALL_PREFIX }}/include" "${{ env.INSTALL_PREFIX }}/lib"
-          # Copia as bibliotecas dinâmicas do earlyswiftdriver (libSwiftDriverExecution.so, libSwiftDriver.so, etc.) se existirem
           if [ -n "$EARLY_DRIVER_DIR" ]; then
             find "$EARLY_DRIVER_DIR" -name "lib*.so*" -exec cp -af {} "${{ env.INSTALL_PREFIX }}/lib/" \; 2>/dev/null || true
           fi
@@ -352,15 +352,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Flang e Rust usam o cache v2-clean já salvo; apenas gnat-ada usa a chave v3-single-llvm-passregistry!
       - name: 0B. Restaurar Cache do Overlay Pronto (${{ matrix.component }}-${{ matrix.arch }})
         id: overlay-cache
         if: inputs.rebuild_frontends != 'true'
         uses: actions/cache/restore@v4
         with:
           path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
-          key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
+          key: omnillvm-overlay-tarball-${{ matrix.component == 'gnat-ada' && env.ADA_CACHE_REV || env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
           restore-keys: |
-            omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
+            omnillvm-overlay-tarball-${{ matrix.component == 'gnat-ada' && env.ADA_CACHE_REV || env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
 
       - name: 1. Baixar Core SDK (${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
@@ -455,7 +456,7 @@ jobs:
           rm -f /opt/overlay-install/lib/*.a
 
       # --- 3B. GNAT-LLVM (Ada) [release/27.1 Fixo Estável para LLVM 21] ---
-      - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico (Shared libLLVM.so)
+      - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico (Shared libLLVM.so — Sem Dupla PassRegistry!)
         if: matrix.component == 'gnat-ada' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends make build-essential gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
@@ -479,10 +480,6 @@ jobs:
           LLVM_SO=$(ls "${{ env.INSTALL_PREFIX }}/lib/"libLLVM-*.so "${{ env.INSTALL_PREFIX }}/lib/"libLLVM.so.* 2>/dev/null | head -n 1)
           if [ -n "$LLVM_SO" ] && [ ! -e "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so" ]; then
             ln -sf "$(basename "$LLVM_SO")" "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so"
-          fi
-          CLANG_CPP_SO=$(ls "${{ env.INSTALL_PREFIX }}/lib/"libclang-cpp.so.* 2>/dev/null | head -n 1)
-          if [ -n "$CLANG_CPP_SO" ] && [ ! -e "${{ env.INSTALL_PREFIX }}/lib/libclang-cpp.so" ]; then
-            ln -sf "$(basename "$CLANG_CPP_SO")" "${{ env.INSTALL_PREFIX }}/lib/libclang-cpp.so"
           fi
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
@@ -520,13 +517,16 @@ jobs:
               f.write(txt)
           EOF
 
+          # CORREÇÃO DEFINITIVA DO ERRO "Corruption of the global PassRegistry / double free":
+          # NUNCA linkar libclang-cpp.so junto com libLLVM-21.so no llvm-gnat1, pois libclang-cpp.so tem
+          # uma cópia estática interna do LLVM (criando 2 PassRegistries na mesma memória!).
+          # Mantemos o -lclangBasic estático original do gnat_llvm.gpr e linkamos APENAS contra a libLLVM-21.so!
           sed -i 's/"-Werror"/"-Wno-error"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/"-gnatg"/"-gnatg", "-gnatwn"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
-          sed -i 's/"-lclangBasic"/"-lclang-cpp"/g' llvm-interface/gnat_llvm.gpr 2>/dev/null || true
 
           make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -cargs:Ada -gnatwn -cargs:C++ -Wno-error -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib -lclang-cpp" \
+            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -cargs:Ada -gnatwn -cargs:C++ -Wno-error -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
             build
@@ -617,7 +617,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
-          key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
+          key: omnillvm-overlay-tarball-${{ matrix.component == 'gnat-ada' && env.ADA_CACHE_REV || env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
 
       - name: Upload do Overlay (${{ matrix.component }}-${{ matrix.arch }})
         uses: actions/upload-artifact@v4
@@ -703,12 +703,8 @@ jobs:
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
           fi
 
-          # CORREÇÃO DEFINITIVA DO ERRO "swiftc: error while loading shared libraries: libSwiftDriverExecution.so":
-          # Se o binário swift-driver tiver sido instalado sem as libs do earlyswiftdriver (libSwiftDriverExecution.so),
-          # apontamos swift, swiftc, swift-symbolgraph-extract e swift-api-digester diretamente para swift-frontend
-          # (que possui o driver C++ completo embutido nativamente e 0 dependências ausentes!)
+          # Configura swift e swiftc para usar o driver nativo integrado do swift-frontend se libSwiftDriverExecution.so faltar
           if [ -x "$TOOLCHAIN/bin/swift-frontend" ] && ldd "$TOOLCHAIN/bin/swiftc" 2>/dev/null | grep -q "not found"; then
-            echo "Configurando swift e swiftc para usar o driver nativo integrado do swift-frontend..."
             rm -f "$TOOLCHAIN/bin/swift-driver" "$TOOLCHAIN/bin/swift-help" 2>/dev/null || true
             ln -sf swift-frontend "$TOOLCHAIN/bin/swift"
             ln -sf swift-frontend "$TOOLCHAIN/bin/swiftc"
@@ -732,7 +728,6 @@ jobs:
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc.a"
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc_eh.a"
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libatomic.a"
-              # Gera uma libatomic.so.1 ELF real (100% Pure LLVM a partir dos builtins do compiler-rt!)
               "$TOOLCHAIN/bin/clang" -shared -fuse-ld=lld -nostdlib \
                 -Wl,-soname,libatomic.so.1 \
                 -Wl,--whole-archive "$BUILTINS_A" -Wl,--no-whole-archive \
@@ -741,7 +736,6 @@ jobs:
             fi
           fi
 
-          # Remove '-latomic' dos Linker Scripts libc++.so para que programas C++ não exijam libatomic.so.1
           find "$TOOLCHAIN/lib" -name "libc++.so" -type f -exec sed -i 's/-latomic//g' {} + 2>/dev/null || true
 
           find "$TOOLCHAIN/lib" -maxdepth 3 \( -name "libc++.so*" -o -name "libc++abi.so*" -o -name "libunwind.so*" \) | while read -r f; do
@@ -750,13 +744,11 @@ jobs:
             fi
           done
 
-          # Remove DT_NEEDED de libatomic.so.1 de qualquer .so binária da toolchain
           find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" ! -name "libatomic.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
           if [ -e "$TOOLCHAIN/lib/libunwind.so" ]; then
             echo "GROUP ( libunwind.so.1 libgcc.a -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
           fi
 
-          # Cria árvore de compatibilidade interna lib/gcc/<triple>/15 dentro de /opt/omnillvm
           FAKE_GCC_DIR="$TOOLCHAIN/lib/gcc/${{ matrix.gnu_triple }}/15"
           mkdir -p "$FAKE_GCC_DIR"
           for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so libatomic.so.1; do
