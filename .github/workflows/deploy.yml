@@ -53,7 +53,7 @@ env:
   # Mantidos os caches de compilação v2-clean do Stage 1 e Stage 2 (pula direto para o Stage 3!)
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
-  PACKAGE_CACHE_REV: v5-llvm-atomic-fix
+  PACKAGE_CACHE_REV: v6-swiftc-driver-fix
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -246,6 +246,7 @@ jobs:
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
           DISPATCH_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "libdispatch-linux-*" | head -n 1)
+          EARLY_DRIVER_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "earlyswiftdriver-linux-*" | head -n 1)
 
           sed -i 's/#define LLVM_ENABLE_DYLIB 0/#define LLVM_ENABLE_DYLIB 1/g' \
             "$LLVM_BUILD_DIR/tools/llvm-config/BuildVariables.inc" || true
@@ -266,6 +267,10 @@ jobs:
           done
 
           mkdir -p "${{ env.INSTALL_PREFIX }}/bin" "${{ env.INSTALL_PREFIX }}/include" "${{ env.INSTALL_PREFIX }}/lib"
+          # Copia as bibliotecas dinâmicas do earlyswiftdriver (libSwiftDriverExecution.so, libSwiftDriver.so, etc.) se existirem
+          if [ -n "$EARLY_DRIVER_DIR" ]; then
+            find "$EARLY_DRIVER_DIR" -name "lib*.so*" -exec cp -af {} "${{ env.INSTALL_PREFIX }}/lib/" \; 2>/dev/null || true
+          fi
           cp -af "$LLVM_BUILD_DIR/lib/libLLVM"*".so"* "${{ env.INSTALL_PREFIX }}/lib/"
           cp -af "$LLVM_BUILD_DIR/lib/libclang"*".so"* "${{ env.INSTALL_PREFIX }}/lib/" || true
           cp -af "$LLVM_BUILD_DIR/bin/clang"* "${{ env.INSTALL_PREFIX }}/bin/"
@@ -669,7 +674,7 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar (100% Swift-LLVM Runtimes), Eliminar -latomic do Linker Script libc++.so e Aplicar Strip
+      - name: 1. Unificar (100% Swift-LLVM Runtimes), Corrigir Driver swiftc e Eliminar -latomic
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev
@@ -698,6 +703,20 @@ jobs:
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
           fi
 
+          # CORREÇÃO DEFINITIVA DO ERRO "swiftc: error while loading shared libraries: libSwiftDriverExecution.so":
+          # Se o binário swift-driver tiver sido instalado sem as libs do earlyswiftdriver (libSwiftDriverExecution.so),
+          # apontamos swift, swiftc, swift-symbolgraph-extract e swift-api-digester diretamente para swift-frontend
+          # (que possui o driver C++ completo embutido nativamente e 0 dependências ausentes!)
+          if [ -x "$TOOLCHAIN/bin/swift-frontend" ] && ldd "$TOOLCHAIN/bin/swiftc" 2>/dev/null | grep -q "not found"; then
+            echo "Configurando swift e swiftc para usar o driver nativo integrado do swift-frontend..."
+            rm -f "$TOOLCHAIN/bin/swift-driver" "$TOOLCHAIN/bin/swift-help" 2>/dev/null || true
+            ln -sf swift-frontend "$TOOLCHAIN/bin/swift"
+            ln -sf swift-frontend "$TOOLCHAIN/bin/swiftc"
+            ln -sf swift-frontend "$TOOLCHAIN/bin/swift-symbolgraph-extract"
+            ln -sf swift-frontend "$TOOLCHAIN/bin/swift-autolink-extract"
+            ln -sf swift-frontend "$TOOLCHAIN/bin/swift-api-digester"
+          fi
+
           # 3. PURE SWIFT-LLVM CONFIG: Configura Clang, Clang++, Swiftc, Rustc e GNAT para usarem
           # nativamente os runtimes compiler-rt, libunwind, libc++ e ld.lld do nosso Swift-LLVM 6.4.1!
           CRTBEGIN_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtbegin*.o" | head -n 1)
@@ -722,9 +741,7 @@ jobs:
             fi
           fi
 
-          # CAUSA RAIZ DO ERRO "libatomic.so.1: cannot open shared object file":
-          # O arquivo libc++.so gerado pelo LLVM é um Linker Script de texto contendo: INPUT(libc++.so.1 -lc++abi -latomic)
-          # Removemos '-latomic' de todos os linker scripts libc++.so para que o linker nunca injete DT_NEEDED: libatomic.so.1!
+          # Remove '-latomic' dos Linker Scripts libc++.so para que programas C++ não exijam libatomic.so.1
           find "$TOOLCHAIN/lib" -name "libc++.so" -type f -exec sed -i 's/-latomic//g' {} + 2>/dev/null || true
 
           find "$TOOLCHAIN/lib" -maxdepth 3 \( -name "libc++.so*" -o -name "libc++abi.so*" -o -name "libunwind.so*" \) | while read -r f; do
