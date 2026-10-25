@@ -54,7 +54,7 @@ env:
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
   ADA_CACHE_REV: v3-single-llvm-passregistry
-  PACKAGE_CACHE_REV: v8-ada-ali-v16
+  PACKAGE_CACHE_REV: v9-ada-link-clean
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -531,7 +531,6 @@ jobs:
           ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
           ADA_INC_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adainclude/system.ads))
           cp -af "$ADA_LIB_DIR/"*.ali /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
-          # Alinha o cabeçalho de versão dos arquivos .ali do sistema (v15 -> v16) com o gnatvsn do llvm-gnat1/llvm-gnatbind!
           sed -i '1s/GNAT Lib v15/GNAT Lib v16/' /opt/overlay-install/lib/rts-native/adalib/*.ali 2>/dev/null || true
           cp -af "$ADA_INC_DIR/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat.so
@@ -696,14 +695,11 @@ jobs:
                  "$TOOLCHAIN/share/man" \
                  "$TOOLCHAIN/share/info" 2>/dev/null || true
 
-          # CORREÇÃO DEFINITIVA DO ERRO: 'error: "system.ads" and "hello_ada.adb" compiled with different GNAT versions, v15 and v16'
-          # Atualiza o cabeçalho de versão na 1ª linha dos arquivos .ali de "GNAT Lib v15" para "GNAT Lib v16"
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
             sed -i '1s/GNAT Lib v15/GNAT Lib v16/' "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
           fi
 
-          # Configura swift e swiftc para usar o driver nativo integrado do swift-frontend se libSwiftDriverExecution.so faltar
           if [ -x "$TOOLCHAIN/bin/swift-frontend" ] && ldd "$TOOLCHAIN/bin/swiftc" 2>/dev/null | grep -q "not found"; then
             rm -f "$TOOLCHAIN/bin/swift-driver" "$TOOLCHAIN/bin/swift-help" 2>/dev/null || true
             ln -sf swift-frontend "$TOOLCHAIN/bin/swift"
@@ -954,7 +950,9 @@ jobs:
              Put_Line ("✅ [5/7] Ada GNAT-LLVM 27.1 Pure LLVM Runtime OK:" & Integer'Image (X));
           end Hello_Ada;
           EOF
-          "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb --RTS="$TOOLCHAIN/lib/rts-native" -largs -B"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
+          # CORREÇÃO: Removido '-B' (que o llvm-gnatlink repassava ao llvm-gnat1 no arquivo de bind b~hello_ada.adb)
+          # e passado '--GCC=$TOOLCHAIN/bin/clang' para que a linkagem final use o Clang Pure LLVM!
+          "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb --RTS="$TOOLCHAIN/lib/rts-native" -largs --GCC="$TOOLCHAIN/bin/clang" -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
           ./hello_ada
 
           # [6/7] Teste Fortran Flang 21 (ISO_C_BINDING ABI com Clang Pure LLVM)
