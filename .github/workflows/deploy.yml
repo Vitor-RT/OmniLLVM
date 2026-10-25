@@ -53,7 +53,7 @@ env:
   # Mantidos os caches de compilação v2-clean do Stage 1 e Stage 2 (pula direto para o Stage 3!)
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
-  PACKAGE_CACHE_REV: v3-no-libatomic
+  PACKAGE_CACHE_REV: v4-pure-llvm-crt
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -280,8 +280,6 @@ jobs:
           cp -ru "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "${{ env.INSTALL_PREFIX }}/include/" 2>/dev/null || true
           cp -ru "$LLVM_BUILD_DIR/lib/cmake" "${{ env.INSTALL_PREFIX }}/lib/" 2>/dev/null || true
 
-          # Garante que todas as .so compiladas em lib/swift (incluindo libdispatch.so, libswiftDispatch.so e lib_CompilerSwift*.so)
-          # tenham symlink direto em /opt/omnillvm/lib/
           find "${{ env.INSTALL_PREFIX }}/lib/swift" -name "*.so*" 2>/dev/null | while read -r f; do
             if [ ! -e "${{ env.INSTALL_PREFIX }}/lib/$(basename "$f")" ]; then
               ln -sf "$f" "${{ env.INSTALL_PREFIX }}/lib/$(basename "$f")" 2>/dev/null || true
@@ -671,7 +669,7 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar (100% Swift-LLVM Runtimes), Remover Dependência de libatomic e Aplicar Strip
+      - name: 1. Unificar (100% Swift-LLVM Runtimes), Remover Dependência de libatomic/GCC e Aplicar Strip
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils
@@ -700,8 +698,8 @@ jobs:
             ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
           fi
 
-          # 3. PURE SWIFT-LLVM CONFIG: Configura Clang e Clang++ para usarem nativamente os runtimes
-          # compiler-rt, libunwind, libc++ e ld.lld compilados pelo nosso próprio Swift-LLVM 6.4.1!
+          # 3. PURE SWIFT-LLVM CONFIG: Configura Clang, Clang++, Swiftc, Rustc e GNAT para usarem
+          # nativamente os runtimes compiler-rt, libunwind, libc++ e ld.lld do nosso Swift-LLVM 6.4.1!
           CRTBEGIN_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtbegin*.o" | head -n 1)
           if [ -n "$CRTBEGIN_FILE" ]; then
             CRT_DIR=$(dirname "$CRTBEGIN_FILE")
@@ -724,15 +722,22 @@ jobs:
             fi
           done
 
-          # CORREÇÃO DEFINITIVA DE "libatomic.so.1: cannot open shared object file":
-          # Remove a entrada DT_NEEDED de libatomic.so.1 das libs da toolchain (como libc++.so.1)
-          # e cria linker script libatomic.so apontando para libgcc.a (compiler-rt builtins do LLVM) + libc!
+          # Remove DT_NEEDED de libatomic.so.1 das libs da toolchain (como libc++.so.1)
+          # e cria linker scripts libatomic.so e libgcc_s.so apontando para compiler-rt e libunwind do LLVM!
           find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
           echo "GROUP ( libgcc.a -lc )" > "$TOOLCHAIN/lib/libatomic.so"
-
-          if [ -e "$TOOLCHAIN/lib/libunwind.so" ] && [ ! -f "$TOOLCHAIN/lib/libgcc_s.so" ]; then
-            echo "GROUP ( libunwind.so.1 -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
+          if [ -e "$TOOLCHAIN/lib/libunwind.so" ]; then
+            echo "GROUP ( libunwind.so.1 libgcc.a -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
           fi
+
+          # Cria árvore de compatibilidade interna lib/gcc/<triple>/15 dentro de /opt/omnillvm
+          # para que swiftc, rustc e llvm-gnatlink encontrem crtbeginS.o, crtendS.o, libgcc.a e libgcc_s.so
+          # mesmo quando nenhum pacote do GCC estiver instalado no Ubuntu!
+          FAKE_GCC_DIR="$TOOLCHAIN/lib/gcc/${{ matrix.gnu_triple }}/15"
+          mkdir -p "$FAKE_GCC_DIR"
+          for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so; do
+            [ -e "$TOOLCHAIN/lib/$item" ] && ln -sf "$TOOLCHAIN/lib/$item" "$FAKE_GCC_DIR/$item"
+          done
 
           cat << 'EOF' > "$TOOLCHAIN/bin/clang.cfg"
           --rtlib=compiler-rt
@@ -753,7 +758,8 @@ jobs:
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
 
-          # 4. Gera o script install-ubuntu26.04-deps.sh com pacotes 100% existentes no Ubuntu 26.04!
+          # 4. Gera o script install-ubuntu26.04-deps.sh que instala apenas as libs de SO do Ubuntu 26.04
+          # e expõe os symlinks do compiler-rt/libunwind do OmniLLVM em /usr/lib/<triple> (Zero GCC necessário!)
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
           set -euo pipefail
@@ -774,6 +780,17 @@ jobs:
             libssl3t64 libssl-dev \
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
+
+          # Se /opt/omnillvm existir e o sistema não tiver libgcc-dev instalado,
+          # cria symlinks em /usr/lib/<multiarch> apontando crtbeginS.o/libgcc.a para o compiler-rt do OmniLLVM!
+          MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
+          if [ -d "/opt/omnillvm/lib" ]; then
+            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so; do
+              if [ -e "/opt/omnillvm/lib/$item" ] && [ ! -e "/usr/lib/$MULTIARCH/$item" ]; then
+                $SUDO ln -sf "/opt/omnillvm/lib/$item" "/usr/lib/$MULTIARCH/$item" 2>/dev/null || true
+              fi
+            done
+          fi
           echo "✅ Todas as bibliotecas dinâmicas de sistema do Ubuntu 26.04 foram instaladas com sucesso!"
           EOF
           chmod +x "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
@@ -911,7 +928,7 @@ jobs:
           assert(p.x + p.y == 42)
           print("✅ [4/7] Swift 6.4.1 Runtime, Stdlib & libdispatch OK: \(p.x + p.y)")
           EOF
-          "$TOOLCHAIN/bin/swiftc" -O -use-ld=lld test_swift.swift -L"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin
+          "$TOOLCHAIN/bin/swiftc" -O -use-ld=lld test_swift.swift -L"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin
           ./test_swift_bin
 
           # [5/7] Teste Ada GNAT-LLVM 27.1 (llvm-gnatmake 100% sem gcc/gnat instalado no sistema!)
@@ -924,7 +941,7 @@ jobs:
              Put_Line ("✅ [5/7] Ada GNAT-LLVM 27.1 Pure LLVM Runtime OK:" & Integer'Image (X));
           end Hello_Ada;
           EOF
-          "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb --RTS="$TOOLCHAIN/lib/rts-native" -largs -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
+          "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb --RTS="$TOOLCHAIN/lib/rts-native" -largs -B"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
           ./hello_ada
 
           # [6/7] Teste Fortran Flang 21 (ISO_C_BINDING ABI com Clang Pure LLVM)
@@ -1037,6 +1054,15 @@ jobs:
             libssl3t64 libssl-dev \
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
+
+          MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
+          if [ -d "/opt/omnillvm/lib" ]; then
+            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libatomic.a libatomic.so; do
+              if [ -e "/opt/omnillvm/lib/$item" ] && [ ! -e "/usr/lib/$MULTIARCH/$item" ]; then
+                $SUDO ln -sf "/opt/omnillvm/lib/$item" "/usr/lib/$MULTIARCH/$item" 2>/dev/null || true
+              fi
+            done
+          fi
           echo "✅ Dependências de sistema instaladas! Extraia o pacote em /opt/omnillvm e adicione /opt/omnillvm/bin ao PATH."
           EOF
           chmod +x install-ubuntu26.04-deps.sh
@@ -1058,15 +1084,10 @@ jobs:
             ### OmniLLVM Unified Toolchain — Ubuntu 26.04 LTS (`amd64` & `arm64`)
             Toolchain **100% Pure Swift-LLVM** (Zero dependência de `gcc`, `libgcc-dev` ou `libstdc++-dev`), unificando `libLLVM.so` 21 (`swift/release/6.4.1`), `compiler-rt`, `libc++`, `libunwind`, `libdispatch` e `ld.lld` para **C, C++, Fortran (Flang), Ada (GNAT 27.1), Rust (1.94.0) e Swift (6.4.1)**.
 
-            #### 1. Instalar bibliotecas dinâmicas de sistema do Ubuntu 26.04 (Sem GCC):
-            ```bash
-            chmod +x install-ubuntu26.04-deps.sh
-            ./install-ubuntu26.04-deps.sh
-            ```
-
-            #### 2. Extrair em `/opt/omnillvm`:
+            #### 1. Extrair em `/opt/omnillvm` e instalar dependências de sistema do Ubuntu 26.04 (Sem GCC):
             ```bash
             sudo tar -I zstd -xf omnillvm-toolchain-ubuntu26.04-$(dpkg --print-architecture).tar.zst -C /opt/
+            sudo /opt/omnillvm/install-ubuntu26.04-deps.sh
             export PATH="/opt/omnillvm/bin:$PATH"
             ```
           files: |
