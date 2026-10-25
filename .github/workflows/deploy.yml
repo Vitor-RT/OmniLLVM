@@ -50,10 +50,10 @@ env:
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
-  # Chaves de Cache permanentes para a arquitetura limpa v2-clean
+  # Mantidos os caches de compilação v2-clean do Stage 1 e Stage 2 (pula direto para o Stage 3!)
   CORE_CACHE_REV: v2-clean-swift641
   FRONTEND_CACHE_REV: v2-clean-r194-g271
-  PACKAGE_CACHE_REV: v2-clean-pkg
+  PACKAGE_CACHE_REV: v3-no-libatomic
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -182,8 +182,7 @@ jobs:
           sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
             $GITHUB_WORKSPACE/src/llvm-project/llvm/tools/llvm-config/llvm-config.cpp
 
-          # 2. CORREÇÃO: Usa vírgula (-Wl,--undefined-version,--version-script) sem espaço!
-          # Assim funciona mesmo quando o CMake envolve a flag inteira entre aspas duplas em libclang.so e libIndexStore.so!
+          # 2. Usa vírgula (-Wl,--undefined-version,--version-script) sem espaço nos version-scripts do Clang/LLVM
           find $GITHUB_WORKSPACE/src/llvm-project -name "CMakeLists.txt" -o -name "*.cmake" | \
             xargs grep -l "version-script" 2>/dev/null | \
             xargs sed -i 's/-Wl,--version-script/-Wl,--undefined-version,--version-script/g' 2>/dev/null || true
@@ -218,6 +217,7 @@ jobs:
               -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
               -DCOMPILER_RT_BUILD_PROFILE=OFF \
               -DLIBCXX_ENABLE_STATIC=OFF \
+              -DLIBCXX_HAS_ATOMIC_LIB=OFF \
               -DLIBCXXABI_ENABLE_STATIC=OFF \
               -DLIBUNWIND_ENABLE_STATIC=OFF \
               -DSWIFT_BUILD_STATIC_STDLIB=OFF \
@@ -671,7 +671,7 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar (100% Swift-LLVM Runtimes), Delegar Libs de SO para APT e Aplicar Strip
+      - name: 1. Unificar (100% Swift-LLVM Runtimes), Remover Dependência de libatomic e Aplicar Strip
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils
@@ -714,6 +714,7 @@ jobs:
             if [ -n "$BUILTINS_A" ]; then
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc.a"
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc_eh.a"
+              ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libatomic.a"
             fi
           fi
 
@@ -722,6 +723,12 @@ jobs:
               ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
             fi
           done
+
+          # CORREÇÃO DEFINITIVA DE "libatomic.so.1: cannot open shared object file":
+          # Remove a entrada DT_NEEDED de libatomic.so.1 das libs da toolchain (como libc++.so.1)
+          # e cria linker script libatomic.so apontando para libgcc.a (compiler-rt builtins do LLVM) + libc!
+          find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
+          echo "GROUP ( libgcc.a -lc )" > "$TOOLCHAIN/lib/libatomic.so"
 
           if [ -e "$TOOLCHAIN/lib/libunwind.so" ] && [ ! -f "$TOOLCHAIN/lib/libgcc_s.so" ]; then
             echo "GROUP ( libunwind.so.1 -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
