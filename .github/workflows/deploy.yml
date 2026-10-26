@@ -51,9 +51,9 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v17-swift-641-swiftsyntax-backtrace
-  FRONTEND_CACHE_REV: v11-hermetic-frontends
-  PACKAGE_CACHE_REV: v11-hermetic-pkg
+  CORE_CACHE_REV: v18-swift-641-libcxx-llvm
+  FRONTEND_CACHE_REV: v12-gnat-clang-cpp-libcxx
+  PACKAGE_CACHE_REV: v12-audit-no-gnu-compilers
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -121,7 +121,8 @@ jobs:
             git cmake ninja-build make clang lld mold ccache patchelf curl \
             python3 pkg-config libncurses-dev libedit-dev \
             libxml2-dev uuid-dev libicu-dev \
-            libblocksruntime-dev zlib1g-dev xz-utils file procps
+            libblocksruntime-dev zlib1g-dev xz-utils file procps \
+            libc++-dev libc++abi-dev
 
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
@@ -237,7 +238,7 @@ jobs:
           export CC=/usr/bin/clang
           export CXX=/usr/bin/clang++
           export CFLAGS="${{ env.MAX_OPT_FLAGS }}"
-          export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
+          export CXXFLAGS="${{ env.MAX_OPT_FLAGS }} -stdlib=libc++"
           export TMPDIR="/tmp"
 
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN/../lib/swift/linux:\$ORIGIN"
@@ -276,7 +277,7 @@ jobs:
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
-              -DCMAKE_CXX_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
+              -DCMAKE_CXX_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }} -stdlib=libc++' \
               -DCMAKE_INSTALL_RPATH='${BUILD_RPATH}' \
               -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
@@ -294,6 +295,7 @@ jobs:
               -DSWIFT_BUILD_STATIC_STDLIB=OFF \
               -DSWIFT_BUILD_STATIC_SDK_OVERLAY=OFF \
               -DSWIFT_ENABLE_BACKTRACING:BOOL=ON \
+              -DLLVM_ENABLE_LIBCXX=ON \
               -DLLVM_USE_LINKER=lld \
               -DSWIFT_USE_LINKER=lld \
               -DSWIFT_ENABLE_LLD_LINKER=ON \
@@ -364,6 +366,17 @@ jobs:
 
           cp -af "$LLVM_BUILD_DIR/lib/libLLVM"*".so"* "$TOOLCHAIN/lib/"
           cp -af "$LLVM_BUILD_DIR/lib/libclang"*".so"* "$TOOLCHAIN/lib/" || true
+          # GNAT-LLVM usa a API C++ interna do Clang, distribuída em libclang-cpp.so.
+          # Não confundir com a API C libclang.so.
+          if ! compgen -G "$TOOLCHAIN/lib/libclang-cpp.so*" >/dev/null; then
+            echo "ERRO: libclang-cpp.so não foi gerada pelo Core LLVM/Clang." >&2
+            exit 1
+          fi
+          if ! test -e "$TOOLCHAIN/lib/libclang-cpp.so"; then
+            CLANG_CPP_SO=$(find "$TOOLCHAIN/lib" -maxdepth 1 -name 'libclang-cpp.so.*' -type f | head -n 1)
+            test -n "$CLANG_CPP_SO" || exit 1
+            ln -sfn "$(basename "$CLANG_CPP_SO")" "$TOOLCHAIN/lib/libclang-cpp.so"
+          fi
           cp -af "$LLVM_BUILD_DIR/bin/clang"* "$TOOLCHAIN/bin/"
           cp -f "$LLVM_BUILD_DIR/bin/llvm-config" "$TOOLCHAIN/bin/"
           cp -f "$LLVM_BUILD_DIR/bin/FileCheck" "$TOOLCHAIN/bin/" || true
@@ -523,7 +536,7 @@ jobs:
       - name: 3A. Compilar Flang + MLIR + flang-rt (Shared libLLVM.so + Zero libquadmath)
         if: matrix.component == 'flang-mlir' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends cmake ninja-build make clang lld mold ccache python3 zlib1g-dev patchelf
+          apt-get install -y -qq --no-install-recommends cmake ninja-build make clang lld mold ccache python3 zlib1g-dev patchelf libc++-dev libc++abi-dev
 
           export TMPDIR="/tmp"
 
@@ -572,6 +585,7 @@ jobs:
             -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
             -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
             -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_ENABLE_LIBCXX=ON \
             -DLLVM_LINK_LLVM_DYLIB=ON \
             -DCLANG_LINK_CLANG_DYLIB=OFF \
             -DMLIR_BUILD_MLIR_C_DYLIB=ON \
@@ -614,16 +628,17 @@ jobs:
       - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico (Shared libLLVM.so + RTS v16 Completa na Origem)
         if: matrix.component == 'gnat-ada' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends make build-essential gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
-          apt-get install -y -qq --no-install-recommends gnat-15 gcc-15 g++-15 || apt-get install -y -qq --no-install-recommends gnat
+          # Apenas o compilador Ada do GNAT 15 serve de bootstrap (NÃO é empacotado).
+          # C/C++, LLD e runtimes C++ usam LLVM; não instalar g++/build-essential.
+          apt-get install -y -qq --no-install-recommends make gprbuild cmake ninja-build \
+            clang lld ccache python3 zlib1g-dev patchelf libc++-dev libc++abi-dev
+          apt-get install -y -qq --no-install-recommends gnat-15 gcc-15
 
-          if [ -x /usr/bin/gnat-15 ]; then
-            GNAT_VER=15
-          else
-            GNAT_VER=14
-          fi
-          ln -sf /usr/bin/gcc-${GNAT_VER} /usr/bin/gcc
-          ln -sf /usr/bin/g++-${GNAT_VER} /usr/bin/g++
+          GNAT_VER=15
+          test -x /usr/bin/gcc-15 || { echo "GNAT 15 bootstrap indisponível" >&2; exit 1; }
+          # O Makefile do AdaCore usa `gcc -dumpmachine` para identificar o alvo.
+          # Esse alias só existe NO CONTÊINER DE COMPILAÇÃO.
+          ln -sf /usr/bin/gcc-15 /usr/bin/gcc
           ln -sf /usr/bin/gnat-${GNAT_VER} /usr/bin/gnat
           ln -sf /usr/bin/gnatmake-${GNAT_VER} /usr/bin/gnatmake
           ln -sf /usr/bin/gnatbind-${GNAT_VER} /usr/bin/gnatbind
@@ -638,8 +653,16 @@ jobs:
           fi
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
-          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
+          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:${LD_LIBRARY_PATH:-}"
+          export CC="${{ env.INSTALL_PREFIX }}/bin/clang"
+          export CXX="${{ env.INSTALL_PREFIX }}/bin/clang++"
           export TMPDIR="/tmp"
+          test -e "${{ env.INSTALL_PREFIX }}/lib/libclang-cpp.so" || {
+            echo "ERRO: libclang-cpp.so está ausente no SDK LLVM (Stage 1)." >&2
+            exit 1
+          }
+          echo "Bibliotecas Clang compartilhadas disponíveis:"
+          ls -l "${{ env.INSTALL_PREFIX }}/lib/"libclang-cpp.so*
 
           mkdir -p $GITHUB_WORKSPACE/ada && cd $GITHUB_WORKSPACE/ada
           git clone --depth 1 --branch ${{ env.GNAT_LLVM_BRANCH }} https://github.com/AdaCore/gnat-llvm.git
@@ -674,13 +697,37 @@ jobs:
 
           sed -i 's/"-Werror"/"-Wno-error"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/"-gnatg"/"-gnatg", "-gnatwn"/g' llvm-interface/*.gpr 2>/dev/null || true
-          sed -i 's/--libs/--link-shared --libs/g' llvm-interface/Makefile || true
+          # GNAT-LLVM 27.1 exige -lclangBasic (estática) e fixa os runtimes GCC.
+          # O Core distribui libclang-cpp.so e libc++/libunwind do próprio LLVM.
+          # Corrigir as DUAS GPRs: a de llvm-gnat1 e a dos auxiliares Ada.
+          python3 - <<'PY_GPR'
+          from pathlib import Path
+          root = Path('llvm-interface')
+          for name in ('gnat_llvm.gpr', 'tools.gpr'):
+              f = root / name
+              data = f.read_text()
+              data = data.replace('for Required_Switches use ("-static-libgcc");', '')
+              data = data.replace('("-static-libstdc++", "-lclangBasic")',
+                                  '("-stdlib=libc++", "-lclang-cpp")')
+              data = data.replace('for Switches ("Ada") use ("-static-libstdc++");', '')
+              f.write_text(data)
+          if '-lclangBasic' in (root / 'gnat_llvm.gpr').read_text():
+              raise SystemExit('ERRO: ainda existe -lclangBasic no projeto GNAT.')
+          if '-lclang-cpp' not in (root / 'gnat_llvm.gpr').read_text():
+              raise SystemExit('ERRO: -lclang-cpp não foi configurado.')
+          PY_GPR
 
+          # Clang/LLVM C++ precisam usar a MESMA ABI (libc++) nos dois estágios.
+          # O Makefile original mistura stdlibc++ e libc++ se não receber CXXFLAGS.
           make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            GPRBUILD_OPTIONS="-j${{ steps.hw.outputs.compile_jobs }} -cargs:Ada -gnatwn -cargs:C++ -Wno-error -largs -fuse-ld=lld -L${{ env.INSTALL_PREFIX }}/lib" \
+            CXXFLAGS="-stdlib=libc++ -Wno-error" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
             build
+
+          test -x llvm-interface/bin/llvm-gnat1
+          # Diagnóstico antecipado de ELF e bibliotecas C++ exigidas pelo Ada.
+          ldd llvm-interface/bin/llvm-gnat1 || true
 
           # CONFIGURAÇÃO PERMANENTE E COMPLETA DA RTS DO ADA NO STAGE 2:
           mkdir -p /opt/overlay-install/bin /opt/overlay-install/lib/rts-native/adalib /opt/overlay-install/lib/rts-native/adainclude
@@ -688,7 +735,8 @@ jobs:
           ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
           ADA_INC_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adainclude/system.ads))
           cp -af "$ADA_LIB_DIR/"*.ali /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
-          sed -i '1s/GNAT Lib v15/GNAT Lib v16/' /opt/overlay-install/lib/rts-native/adalib/*.ali 2>/dev/null || true
+          # Não falsificar a versão da RTS. Os arquivos .ali são do GNAT 15 e
+          # devem conservar a identificação real do compilador que os gerou.
           cp -af "$ADA_INC_DIR/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
 
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat.so
@@ -711,7 +759,7 @@ jobs:
       - name: 3C. Compilar Apenas Rustc 1.94.0 + Stdlib (Sem Cargo + link-shared = true + mold)
         if: matrix.component == 'rust' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends make build-essential cmake ninja-build clang mold lld ccache python3 curl pkg-config zlib1g-dev
+          apt-get install -y -qq --no-install-recommends make cmake ninja-build clang mold lld ccache python3 curl pkg-config zlib1g-dev libc++-dev libc++abi-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
@@ -734,6 +782,7 @@ jobs:
           [llvm]
           download-ci-llvm = false
           link-shared = true
+          use-libcxx = true
           tests = false
 
           [build]
@@ -875,15 +924,12 @@ jobs:
             ln -sf "$CRT_DIR"/clang_rt.crtendS*.o "$TOOLCHAIN/lib/crtendS.o" 2>/dev/null || true
             BUILTINS_A=$(find "$CRT_DIR" -name "libclang_rt.builtins*.a" | head -n 1)
             if [ -n "$BUILTINS_A" ]; then
-              ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc.a"
-              ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc_eh.a"
-              ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libatomic.a"
+              # Builtins LLVM nativos: não os renomear para falsos arquivos GCC.
+              ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libclang_rt.builtins.a"
             fi
           fi
-          if [ -e "$TOOLCHAIN/lib/libunwind.so" ]; then
-            echo "GROUP ( libunwind.so.1 libgcc.a -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
-            echo "INPUT ( libunwind.so.1 )" > "$TOOLCHAIN/lib/libunwind.a"
-          fi
+          # libunwind.so já fornece o unwinder LLVM; não gerar libgcc_s.so
+          # ou libunwind.a fictícios por redirecionamento.
 
           cat << 'EOF' > "$TOOLCHAIN/bin/clang.cfg"
           --rtlib=compiler-rt
@@ -920,7 +966,7 @@ jobs:
           else
             SUDO=""
           fi
-          echo "📦 Instalando bibliotecas dinâmicas nativas de sistema do Ubuntu 26.04 para o OmniLLVM (Zero GCC / Zero Package Managers)..."
+          echo "📦 Instalando dependências de sistema (GNAT RTS 15 é a exceção Ada necessária)..."
           export DEBIAN_FRONTEND=noninteractive
           $SUDO apt-get update -qq
           $SUDO apt-get install -y --no-install-recommends \
@@ -931,14 +977,8 @@ jobs:
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
 
-          MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
-          if [ -d "/opt/omnillvm/lib" ]; then
-            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libunwind.a libatomic.a libatomic.so libatomic.so.1; do
-              if [ -e "/opt/omnillvm/lib/$item" ] && [ ! -e "/usr/lib/$MULTIARCH/$item" ]; then
-                $SUDO ln -sf "/opt/omnillvm/lib/$item" "/usr/lib/$MULTIARCH/$item" 2>/dev/null || true
-              fi
-            done
-          fi
+          # Não alterar /usr/lib e não instalar substitutos falsos de libgcc.
+          # O clang.cfg usa compiler-rt + libunwind + libc++ sob /opt/omnillvm.
           echo "✅ Todas as bibliotecas dinâmicas de sistema do Ubuntu 26.04 foram instaladas com sucesso!"
           EOF
           chmod +x "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
@@ -965,6 +1005,21 @@ jobs:
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/libgnarl-15.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/libgnarl.so"
           fi
+
+          # Auditoria estrutural: nenhum executável nem runtime de GCC/G++ no tarball.
+          # GNAT LLVM conserva links para a RTS Ada do sistema quando necessária.
+          if find "$TOOLCHAIN/bin" -maxdepth 1 \
+            \( -name 'gcc' -o -name 'gcc-*' -o -name 'g++' -o -name 'g++-*' \
+               -o -name 'cc1' -o -name 'cc1plus' -o -name 'gnat1' \) | grep -q .; then
+            echo "ERRO: compiladores GNU inesperados no pacote final" >&2
+            exit 1
+          fi
+          if find "$TOOLCHAIN/lib" -maxdepth 2 \
+            \( -name 'libstdc++*' -o -name 'libgcc*' \) | grep -q .; then
+            echo "ERRO: artefatos da biblioteca C++/GCC no pacote final" >&2
+            exit 1
+          fi
+          test -e "$TOOLCHAIN/lib/libclang-cpp.so" || exit 1
 
           # 6. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
           find "$TOOLCHAIN/bin" -type f -print0 | xargs -0 -n 10 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
@@ -1017,7 +1072,21 @@ jobs:
             echo "❌ ERRO FATAL: Foram encontradas bibliotecas ausentes na varredura global ELF!"
             exit 1
           fi
-          echo "✅ [1/7] Varredura ELF Global 100% Limpa: Zero 'not found' em toda a árvore /opt/omnillvm!"
+          echo "✅ [1/7] Varredura ELF Global: nenhuma biblioteca ausente!"
+
+          # libc++ substitui libstdc++; barrar dependências GNU C++ na release.
+          if find "$TOOLCHAIN/bin" "$TOOLCHAIN/lib" -type f -exec file {} + \
+             | awk -F: '/ELF/ {print $1}' | while IFS= read -r elf; do
+                if patchelf --print-needed "$elf" 2>/dev/null | grep -q '^libstdc++'; then
+                  echo "ERRO: $elf ainda depende de libstdc++.so" >&2
+                  exit 1
+                fi
+              done; then
+            echo "✅ Nenhum binário ELF depende de libstdc++.so"
+          else
+            echo "ERRO: dependência C++ GNU detectada. Compile esse componente com LLVM libc++." >&2
+            exit 1
+          fi
 
           # [2/7] Teste C23 + C++23 usando 100% Swift-LLVM (compiler-rt + libc++ + libunwind + ld.lld)
           echo "-> [2/7] Testando Clang/Clang++ Pure Swift-LLVM (compiler-rt + libc++ + libunwind + lld)..."
@@ -1204,7 +1273,7 @@ jobs:
           else
             SUDO=""
           fi
-          echo "📦 Instalando bibliotecas dinâmicas nativas de sistema do Ubuntu 26.04 para o OmniLLVM (Zero GCC / Zero Package Managers)..."
+          echo "📦 Instalando dependências de sistema (GNAT RTS 15 é a exceção Ada necessária)..."
           export DEBIAN_FRONTEND=noninteractive
           $SUDO apt-get update -qq
           $SUDO apt-get install -y --no-install-recommends \
@@ -1215,14 +1284,8 @@ jobs:
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
 
-          MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')
-          if [ -d "/opt/omnillvm/lib" ]; then
-            for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libunwind.a libatomic.a libatomic.so libatomic.so.1; do
-              if [ -e "/opt/omnillvm/lib/$item" ] && [ ! -e "/usr/lib/$MULTIARCH/$item" ]; then
-                $SUDO ln -sf "/opt/omnillvm/lib/$item" "/usr/lib/$MULTIARCH/$item" 2>/dev/null || true
-              fi
-            done
-          fi
+          # Não alterar /usr/lib e não instalar substitutos falsos de libgcc.
+          # O clang.cfg usa compiler-rt + libunwind + libc++ sob /opt/omnillvm.
           echo "✅ Dependências de sistema instaladas! Extraia o pacote em /opt/omnillvm e adicione /opt/omnillvm/bin ao PATH."
           EOF
           chmod +x install-ubuntu26.04-deps.sh
@@ -1242,7 +1305,7 @@ jobs:
           name: "OmniLLVM Unified Toolchain - Release ${{ steps.meta.outputs.tag }} [Ubuntu 26.04 | AMD64 & ARM64]"
           body: |
             ### OmniLLVM Unified Toolchain — Ubuntu 26.04 LTS (`amd64` & `arm64`)
-            Toolchain **100% Pure Swift-LLVM Hermética** (Zero dependência de `gcc`, `libgcc-dev`, `libstdc++-dev` e zero gerenciadores de pacotes externos), unificando `libLLVM.so` 21 (`swift/release/6.4.1`), `compiler-rt`, `libc++`, `libunwind`, `libdispatch`, `flang-rt` e `ld.lld` para **C, C++, Fortran (Flang), Ada (GNAT 27.1), Rust (Rustc 1.94.0) e Swift (Swiftc 6.4.1)**.
+            Toolchain **Swift-LLVM com bibliotecas C++ do LLVM** (sem executáveis GCC/G++ no pacote e sem `libstdc++` vinculada; a RTS Ada `libgnat-15` permanece como dependência indispensável do GNAT bootstrap), unificando `libLLVM.so` 21 (`swift/release/6.4.1`), `compiler-rt`, `libc++`, `libunwind`, `libdispatch`, `flang-rt` e `ld.lld` para **C, C++, Fortran (Flang), Ada (GNAT 27.1), Rust (Rustc 1.94.0) e Swift (Swiftc 6.4.1)**.
 
             #### 1. Extrair em `/opt/omnillvm` e instalar dependências de sistema do Ubuntu 26.04 (Sem GCC):
             ```bash
