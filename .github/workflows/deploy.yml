@@ -51,7 +51,7 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v14-swift-bootstrap-641-u2604-lld
+  CORE_CACHE_REV: v15-swift-641-no-backtrace
   FRONTEND_CACHE_REV: v11-hermetic-frontends
   PACKAGE_CACHE_REV: v11-hermetic-pkg
   DEBIAN_FRONTEND: noninteractive
@@ -240,6 +240,8 @@ jobs:
 
           # Estas opções impedem que build-script procure o executável ausente
           # swift-driver/Utilities/build-script-helper.py (erro "earlyswiftdriver").
+          # swift-syntax foi omitido intencionalmente e SwiftMacros nao sera gerado.
+          # Desative apenas o backtrace auxiliar, mantendo stdlib e compilador.
           ./swift/utils/build-script \
             --release \
             --skip-early-swift-driver \
@@ -277,6 +279,7 @@ jobs:
               -DLIBUNWIND_ENABLE_STATIC=OFF \
               -DSWIFT_BUILD_STATIC_STDLIB=OFF \
               -DSWIFT_BUILD_STATIC_SDK_OVERLAY=OFF \
+              -DSWIFT_ENABLE_BACKTRACING=OFF \
               -DLLVM_USE_LINKER=lld \
               -DSWIFT_USE_LINKER=lld \
               -DSWIFT_ENABLE_LLD_LINKER=ON \
