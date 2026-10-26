@@ -51,7 +51,7 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v15-swift-641-no-backtrace
+  CORE_CACHE_REV: v16-swift-641-cmake-swiftsyntax
   FRONTEND_CACHE_REV: v11-hermetic-frontends
   PACKAGE_CACHE_REV: v11-hermetic-pkg
   DEBIAN_FRONTEND: noninteractive
@@ -178,8 +178,8 @@ jobs:
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
           git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
-          # Clona os fontes do compilador/LLVM/cmark sem baixar SwiftPM e o Swift Driver externo.
-          # O build usará --skip-early-swift-driver e --skip-early-swiftsyntax.
+          # Clona compilador/LLVM/cmark, sem compilar SwiftPM nem o Swift Driver externo.
+          # O swift-syntax e obrigatorio para os alvos SwiftMacros usados pela stdlib.
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history \
             --skip-repository swiftpm \
             --skip-repository swift-driver \
@@ -211,9 +211,22 @@ jobs:
           if [ ! -d "$GITHUB_WORKSPACE/src/cmark" ] && [ ! -d "$GITHUB_WORKSPACE/src/swift-cmark" ]; then
             ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
           fi
-          # Não manter fontes de SwiftPM nem do Swift Driver externo.
-          # O build-script é instruído explicitamente a NÃO executar earlyswiftdriver.
-          rm -rf $GITHUB_WORKSPACE/src/swiftpm $GITHUB_WORKSPACE/src/swift-driver
+          # A stdlib do Swift 6.4.1 usa SwiftMacros; isso exige swift-syntax.
+          # A biblioteca e integrada por CMake, sem executar Swift Package Manager.
+          if [ ! -f "$GITHUB_WORKSPACE/src/swift-syntax/CMakeLists.txt" ]; then
+            rm -rf "$GITHUB_WORKSPACE/src/swift-syntax"
+            git clone --depth 1 --single-branch --branch "${{ env.SWIFT_SCHEME }}" \
+              https://github.com/swiftlang/swift-syntax.git "$GITHUB_WORKSPACE/src/swift-syntax"
+          fi
+          test -f "$GITHUB_WORKSPACE/src/swift-syntax/CMakeLists.txt" || {
+            echo "ERRO: swift-syntax não foi baixado; SwiftMacros é necessário para a biblioteca padrão." >&2
+            exit 1
+          }
+          echo "swift-syntax pronto: $(git -C "$GITHUB_WORKSPACE/src/swift-syntax" rev-parse --short HEAD)"
+
+          # Remover apenas gerenciadores de pacotes e driver externo.
+          # O build-script é instruído a NÃO executar earlyswiftdriver.
+          rm -rf "$GITHUB_WORKSPACE/src/swiftpm" "$GITHUB_WORKSPACE/src/swift-driver"
 
       - name: 4. Compilar e Configurar Core 6.4.1 Completo na Origem (LLVM + Clang + Swiftc + LLDB + Runtimes)
         if: steps.core-cache.outputs.cache-hit != 'true'
@@ -238,14 +251,14 @@ jobs:
             xargs grep -l "version-script" 2>/dev/null | \
             xargs sed -i 's/-Wl,--version-script/-Wl,--undefined-version,--version-script/g' 2>/dev/null || true
 
-          # Estas opções impedem que build-script procure o executável ausente
-          # swift-driver/Utilities/build-script-helper.py (erro "earlyswiftdriver").
-          # swift-syntax foi omitido intencionalmente e SwiftMacros nao sera gerado.
-          # Desative apenas o backtrace auxiliar, mantendo stdlib e compilador.
+          # O driver externo continua desabilitado, mas o suporte a SwiftSyntax
+          # precisa ficar ATIVO: SwiftMacros é dependência da biblioteca padrão.
+          # O build-script configura SWIFT_BUILD_SWIFT_SYNTAX=ON automaticamente
+          # quando --skip-early-swiftsyntax NÃO é informado.
+          # Mantemos o backtrace desativado para reduzir o escopo do Stage 1.
           ./swift/utils/build-script \
             --release \
             --skip-early-swift-driver \
-            --skip-early-swiftsyntax \
             --no-assertions \
             --no-swift-stdlib-assertions \
             --bootstrapping=hosttools \
