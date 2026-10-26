@@ -51,9 +51,11 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v11-hermetic-core
+  CORE_CACHE_REV: v12-no-early-swift-driver
   FRONTEND_CACHE_REV: v11-hermetic-frontends
   PACKAGE_CACHE_REV: v11-hermetic-pkg
+  # Exige o driver C++ legado em vez de tentar iniciar um driver Swift externo.
+  SWIFT_USE_OLD_DRIVER: "1"
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -165,7 +167,8 @@ jobs:
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
           git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
-          # Pula o clone de repositórios de gerenciadores de pacotes (swiftpm, swift-driver externo, etc.) que não são necessários!
+          # Clona os fontes do compilador/LLVM/cmark sem baixar SwiftPM e o Swift Driver externo.
+          # O build usará --skip-early-swift-driver e --skip-early-swiftsyntax.
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history \
             --skip-repository swiftpm \
             --skip-repository swift-driver \
@@ -184,7 +187,6 @@ jobs:
             --skip-repository swift-docc-render-artifact \
             --skip-repository swift-docc-symbolkit \
             --skip-repository swift-markdown \
-            --skip-repository swift-cmark \
             --skip-repository swift-format \
             --skip-repository swift-testing \
             --skip-repository swift-foundation \
@@ -194,12 +196,12 @@ jobs:
             -j ${{ steps.hw.outputs.compile_jobs }} || \
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
 
-          # Garante que swift-cmark (usado pelo parser interno do compilador Swift) exista
+          # Garante que cmark (dependência do compilador Swift) esteja disponível.
           if [ ! -d "$GITHUB_WORKSPACE/src/cmark" ] && [ ! -d "$GITHUB_WORKSPACE/src/swift-cmark" ]; then
             ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
           fi
-          # Remove pastas de gerenciadores de pacotes (swiftpm / swift-driver) para garantir que o build-script
-          # use diretamente o driver C++ nativo embutido no swift-frontend (economizando tempo de build e dezenas de MB!)
+          # Não manter fontes de SwiftPM nem do Swift Driver externo.
+          # O build-script é instruído explicitamente a NÃO executar earlyswiftdriver.
           rm -rf $GITHUB_WORKSPACE/src/swiftpm $GITHUB_WORKSPACE/src/swift-driver
 
       - name: 4. Compilar e Configurar Core 6.4.1 Completo na Origem (LLVM + Clang + Swiftc + LLDB + Runtimes)
@@ -213,6 +215,7 @@ jobs:
           export CFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export TMPDIR="/tmp"
+          export SWIFT_USE_OLD_DRIVER=1
 
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN/../lib/swift/linux:\$ORIGIN"
 
@@ -225,8 +228,12 @@ jobs:
             xargs grep -l "version-script" 2>/dev/null | \
             xargs sed -i 's/-Wl,--version-script/-Wl,--undefined-version,--version-script/g' 2>/dev/null || true
 
+          # Estas opções impedem que build-script procure o executável ausente
+          # swift-driver/Utilities/build-script-helper.py (erro "earlyswiftdriver").
           ./swift/utils/build-script \
             --release \
+            --skip-early-swift-driver \
+            --skip-early-swiftsyntax \
             --no-assertions \
             --no-swift-stdlib-assertions \
             --bootstrapping=hosttools \
