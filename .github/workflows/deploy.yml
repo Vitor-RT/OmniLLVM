@@ -73,7 +73,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
-      options: --privileged -v /opt:/opt --shm-size=8g --mount type=tmpfs,destination=/tmp,tmpfs-size=6g
+      # /tmp precisa permitir execucao: o Swift/CMake cria e executa binarios de teste ali.
+      options: --privileged -v /opt:/opt --shm-size=8g --tmpfs /tmp:rw,exec,nosuid,size=6g,mode=1777
     timeout-minutes: 300
     strategy:
       fail-fast: false
@@ -425,7 +426,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
-      options: --privileged -v /opt:/opt --shm-size=8g --mount type=tmpfs,destination=/tmp,tmpfs-size=6g
+      # /tmp precisa permitir execucao: o Swift/CMake cria e executa binarios de teste ali.
+      options: --privileged -v /opt:/opt --shm-size=8g --tmpfs /tmp:rw,exec,nosuid,size=6g,mode=1777
     timeout-minutes: 180
     strategy:
       fail-fast: false
