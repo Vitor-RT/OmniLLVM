@@ -46,16 +46,14 @@ env:
   # ==========================================================================
   SWIFT_SCHEME: release/6.4.1
   SWIFT_LLVM_BRANCH: swift/release/6.4.1
-  SWIFT_BOOTSTRAP_VER: 6.0.3
+  SWIFT_BOOTSTRAP_VER: 6.4.1
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v12-no-early-swift-driver
+  CORE_CACHE_REV: v14-swift-bootstrap-641-u2604-lld
   FRONTEND_CACHE_REV: v11-hermetic-frontends
   PACKAGE_CACHE_REV: v11-hermetic-pkg
-  # Exige o driver C++ legado em vez de tentar iniciar um driver Swift externo.
-  SWIFT_USE_OLD_DRIVER: "1"
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -131,9 +129,12 @@ jobs:
           ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
           ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
 
-          SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2404${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu24.04${{ matrix.swift_dir_arch }}.tar.gz"
+          SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2604${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu26.04${{ matrix.swift_dir_arch }}.tar.gz"
           mkdir -p /opt/swift-bootstrap
-          curl -fsSL "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
+          echo "Baixando Swift bootstrap ${{ env.SWIFT_BOOTSTRAP_VER }} para Ubuntu 26.04 (${{ matrix.arch }})"
+          curl --fail --location --show-error --silent --retry 3 "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
+          /opt/swift-bootstrap/bin/swiftc --version
+          /opt/swift-bootstrap/bin/swiftc --version | grep -F "${{ env.SWIFT_BOOTSTRAP_VER }}"
           rm -f /opt/swift-bootstrap/bin/clang* /opt/swift-bootstrap/bin/lld* /opt/swift-bootstrap/bin/ld* /opt/swift-bootstrap/bin/lldb*
           ln -sf /usr/bin/clang /opt/swift-bootstrap/bin/clang
           ln -sf /usr/bin/clang++ /opt/swift-bootstrap/bin/clang++
@@ -141,6 +142,15 @@ jobs:
           ln -sf /usr/bin/ld.lld /opt/swift-bootstrap/bin/ld
           ln -sf /usr/bin/lld /opt/swift-bootstrap/bin/lld
           ln -sf /usr/bin/mold /opt/swift-bootstrap/bin/ld.mold
+
+          # Verifica antecipadamente o bootstrap Swift usando o linker LLVM.
+          # Usamos o Swift 6.4.1 nativo para Ubuntu 26.04 e forçamos LLVM LLD.
+          printf 'print("Swift bootstrap LLD OK")\n' > /tmp/omnillvm-swift-bootstrap-test.swift
+          /opt/swift-bootstrap/bin/swiftc -use-ld=lld \
+            /tmp/omnillvm-swift-bootstrap-test.swift \
+            -o /tmp/omnillvm-swift-bootstrap-test
+          /tmp/omnillvm-swift-bootstrap-test
+          rm -f /tmp/omnillvm-swift-bootstrap-test.swift /tmp/omnillvm-swift-bootstrap-test
 
           CORES=$(nproc --all)
           COMPILE_JOBS=$(( CORES + 2 ))
@@ -215,7 +225,6 @@ jobs:
           export CFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export TMPDIR="/tmp"
-          export SWIFT_USE_OLD_DRIVER=1
 
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN/../lib/swift/linux:\$ORIGIN"
 
@@ -268,6 +277,10 @@ jobs:
               -DSWIFT_BUILD_STATIC_STDLIB=OFF \
               -DSWIFT_BUILD_STATIC_SDK_OVERLAY=OFF \
               -DLLVM_USE_LINKER=lld \
+              -DSWIFT_USE_LINKER=lld \
+              -DSWIFT_ENABLE_LLD_LINKER=ON \
+              -DSWIFT_ENABLE_GOLD_LINKER=OFF \
+              -DCMAKE_Swift_FLAGS=-use-ld=lld \
               -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
               -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
               -DLLVM_BUILD_LLVM_DYLIB=ON \
