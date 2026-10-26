@@ -51,7 +51,7 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v16-swift-641-cmake-swiftsyntax
+  CORE_CACHE_REV: v17-swift-641-swiftsyntax-backtrace
   FRONTEND_CACHE_REV: v11-hermetic-frontends
   PACKAGE_CACHE_REV: v11-hermetic-pkg
   DEBIAN_FRONTEND: noninteractive
@@ -255,7 +255,8 @@ jobs:
           # precisa ficar ATIVO: SwiftMacros é dependência da biblioteca padrão.
           # O build-script configura SWIFT_BUILD_SWIFT_SYNTAX=ON automaticamente
           # quando --skip-early-swiftsyntax NÃO é informado.
-          # Mantemos o backtrace desativado para reduzir o escopo do Stage 1.
+          # Backtracing precisa ficar ATIVO: o runtime exporta o símbolo
+          # _swift_backtrace_isThunkFunction usado por lib_CompilerSwiftSyntax.so.
           ./swift/utils/build-script \
             --release \
             --skip-early-swift-driver \
@@ -292,7 +293,7 @@ jobs:
               -DLIBUNWIND_ENABLE_STATIC=OFF \
               -DSWIFT_BUILD_STATIC_STDLIB=OFF \
               -DSWIFT_BUILD_STATIC_SDK_OVERLAY=OFF \
-              -DSWIFT_ENABLE_BACKTRACING=OFF \
+              -DSWIFT_ENABLE_BACKTRACING:BOOL=ON \
               -DLLVM_USE_LINKER=lld \
               -DSWIFT_USE_LINKER=lld \
               -DSWIFT_ENABLE_LLD_LINKER=ON \
@@ -319,6 +320,10 @@ jobs:
 
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
+          # O driver deve inicializar com todas as bibliotecas runtime carregadas,
+          # inclusive lib_CompilerSwiftSyntax.so, sem símbolos indefinidos.
+          test -n "$SWIFT_BUILD_DIR" && test -x "$SWIFT_BUILD_DIR/bin/swiftc"
+          "$SWIFT_BUILD_DIR/bin/swiftc" --version
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
           DISPATCH_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "libdispatch-linux-*" | head -n 1)
 
