@@ -51,9 +51,9 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v18-swift-641-libcxx-llvm
-  FRONTEND_CACHE_REV: v12-gnat-clang-cpp-libcxx
-  PACKAGE_CACHE_REV: v12-audit-no-gnu-compilers
+  CORE_CACHE_REV: v19-swift-641-libcxx-llvm-unwindfix
+  FRONTEND_CACHE_REV: v13-gnat-clang-cpp-libcxx-unwindfix
+  PACKAGE_CACHE_REV: v13-audit-manifest
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -123,6 +123,25 @@ jobs:
             libxml2-dev uuid-dev libicu-dev \
             libblocksruntime-dev zlib1g-dev xz-utils file procps \
             libc++-dev libc++abi-dev
+
+          # FIX: binários do build linkados com libc++ (host) precisam de libunwind.so.1 (LLVM)
+          # em runtime, pois o ninja executa ferramentas recém-compiladas (ex.: swift-compatibility-symbols).
+          # No Ubuntu esse arquivo fica em /usr/lib/llvm-*/lib, fora do caminho padrão do loader.
+          apt-get install -y -qq --no-install-recommends libunwind-21-dev \
+            || apt-get install -y -qq --no-install-recommends libunwind-20-dev \
+            || true
+          UNW=$(find /usr/lib -name 'libunwind.so.1*' 2>/dev/null | head -n 1)
+          if [ -z "$UNW" ]; then
+            echo "ERRO: libunwind.so.1 (LLVM) não encontrada após a instalação dos pacotes." >&2
+            find /usr/lib -name 'libunwind*' 2>/dev/null | head -n 20 >&2 || true
+            exit 1
+          fi
+          UNW_DIR=$(dirname "$UNW")
+          echo "libunwind do LLVM em: $UNW_DIR"
+          echo "$UNW_DIR" > /etc/ld.so.conf.d/llvm-libunwind.conf
+          ldconfig
+          echo "LD_LIBRARY_PATH=$UNW_DIR:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          ldconfig -p | grep libunwind || true
 
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
@@ -240,6 +259,11 @@ jobs:
           export CFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }} -stdlib=libc++"
           export TMPDIR="/tmp"
+
+          # FIX: garante que ferramentas executadas durante o build achem libunwind.so.1 do LLVM
+          UNW_DIR=$(dirname "$(find /usr/lib -name 'libunwind.so.1*' 2>/dev/null | head -n 1)")
+          export LD_LIBRARY_PATH="$UNW_DIR:${LD_LIBRARY_PATH:-}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN/../lib/swift/linux:\$ORIGIN"
 
@@ -509,6 +533,19 @@ jobs:
         run: |
           apt-get install -y -qq --no-install-recommends curl git xz-utils procps
 
+          # FIX: libunwind.so.1 do LLVM visível para binários linkados com libc++ executados durante o build
+          apt-get install -y -qq --no-install-recommends libc++-dev libc++abi-dev || true
+          apt-get install -y -qq --no-install-recommends libunwind-21-dev \
+            || apt-get install -y -qq --no-install-recommends libunwind-20-dev \
+            || true
+          UNW=$(find /usr/lib -name 'libunwind.so.1*' 2>/dev/null | head -n 1)
+          if [ -n "$UNW" ]; then
+            UNW_DIR=$(dirname "$UNW")
+            echo "$UNW_DIR" > /etc/ld.so.conf.d/llvm-libunwind.conf
+            ldconfig
+            echo "LD_LIBRARY_PATH=$UNW_DIR:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+          fi
+
           CORES=$(nproc --all)
           COMPILE_JOBS=$(( CORES + 2 ))
           echo "cores=$CORES" >> $GITHUB_OUTPUT
@@ -762,7 +799,7 @@ jobs:
           apt-get install -y -qq --no-install-recommends make cmake ninja-build clang mold lld ccache python3 curl pkg-config zlib1g-dev libc++-dev libc++abi-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
-          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
+          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:${LD_LIBRARY_PATH:-}"
           export TMPDIR="/tmp"
           export RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-L${{ env.INSTALL_PREFIX }}/lib"
 
@@ -1028,6 +1065,88 @@ jobs:
             -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
           \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
 
+      # ----------------------------------------------------------------------
+      # NOVO: Manifesto de arquivos + verificação de componentes essenciais.
+      # Roda ANTES de purgar/testar, para falhar cedo se algo foi mascarado por '|| true'.
+      # ----------------------------------------------------------------------
+      - name: "📋 1B. Manifesto de Arquivos + Verificação de Componentes Essenciais (${{ matrix.arch }})"
+        if: steps.pkg-cache.outputs.cache-hit != 'true'
+        run: |
+          TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
+          cd "$TOOLCHAIN"
+
+          # Manifesto normalizado (x86_64/aarch64/amd64/arm64 -> ARCH) para diff entre arquiteturas.
+          find . | sed -E 's/x86_64|aarch64|amd64|arm64|x86-64/ARCH/g' | LC_ALL=C sort > "$GITHUB_WORKSPACE/manifest-${{ matrix.arch }}.txt"
+
+          TOTAL=$(wc -l < "$GITHUB_WORKSPACE/manifest-${{ matrix.arch }}.txt")
+          FILES=$(find . -type f | wc -l)
+          LINKS=$(find . -type l | wc -l)
+          DIRS=$(find . -type d | wc -l)
+          echo "Entradas totais: $TOTAL | arquivos: $FILES | symlinks: $LINKS | diretórios: $DIRS"
+
+          {
+            echo "### Contagem (${{ matrix.arch }})"
+            echo "| Entradas | Arquivos | Symlinks | Diretórios |"
+            echo "|---|---|---|---|"
+            echo "| $TOTAL | $FILES | $LINKS | $DIRS |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Contagem por diretório de topo (ajuda a localizar onde as arquiteturas divergem)
+          for d in bin lib include share libexec; do
+            if [ -d "$d" ]; then
+              echo "  $d: $(find "$d" | wc -l) entradas"
+            fi
+          done
+
+          # Componentes essenciais: precisam existir em AMBAS as arquiteturas.
+          MISSING=0
+          check() {
+            local label="$1"; shift
+            if [ -z "$(find "$TOOLCHAIN" "$@" 2>/dev/null | head -n 1)" ]; then
+              echo "❌ AUSENTE: $label"
+              MISSING=1
+            else
+              echo "✅ ok: $label"
+            fi
+          }
+          check "clang"                    -path '*/bin/clang' \( -type f -o -type l \)
+          check "ld.lld"                   -path '*/bin/ld.lld' \( -type f -o -type l \)
+          check "llvm-config"              -path '*/bin/llvm-config'
+          check "libLLVM.so"               -name 'libLLVM*.so*'
+          check "libclang-cpp.so"          -name 'libclang-cpp.so*'
+          check "libc++.so"                -name 'libc++.so*'
+          check "libc++abi.so"             -name 'libc++abi.so*'
+          check "libunwind.so"             -name 'libunwind.so*'
+          check "compiler-rt builtins"     -name 'libclang_rt.builtins*.a'
+          check "swiftc / swift-frontend"  -path '*/bin/swift-frontend'
+          check "libswiftCore.so"          -name 'libswiftCore.so'
+          check "libdispatch.so"           -name 'libdispatch.so'
+          check "libBlocksRuntime.so"      -name 'libBlocksRuntime.so*'
+          check "lldb"                     -path '*/bin/lldb'
+          check "liblldb.so"               -name 'liblldb*.so*'
+          check "flang"                    \( -path '*/bin/flang' -o -path '*/bin/flang-new' \)
+          check "libflang_rt (runtime)"    -name 'libflang_rt*'
+          check "libFortran*"              -name 'libFortran*'
+          check "libMLIR*"                 -name 'libMLIR*.so*'
+          check "rustc"                    -path '*/bin/rustc'
+          check "librustc_driver"          -name 'librustc_driver*.so'
+          check "llvm-gnat1"               -path '*/bin/llvm-gnat1'
+          check "llvm-gnatmake"            -path '*/bin/llvm-gnatmake'
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "ERRO FATAL: componente(s) essencial(is) ausente(s) em ${{ matrix.arch }}. Provável falha mascarada por '|| true' no build." >&2
+            exit 1
+          fi
+          echo "✅ Todos os componentes essenciais presentes em ${{ matrix.arch }}"
+
+      - name: Upload do Manifesto (${{ matrix.arch }})
+        if: steps.pkg-cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-manifest-${{ matrix.arch }}
+          path: manifest-${{ matrix.arch }}.txt
+          retention-days: 7
+
       - name: "🧪 2. Auditoria ELF Global (Cenários A e B) + Suíte Industrial de 7 Testes (${{ matrix.arch }})"
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
@@ -1228,6 +1347,68 @@ jobs:
           path: omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst
           compression-level: 0
           retention-days: 1
+
+  # ============================================================================
+  # NOVO: Compara os manifestos amd64 x arm64 (informativo — não bloqueia a release)
+  # ============================================================================
+  compare-manifests:
+    name: "Compare: amd64 vs arm64 (arquivos normalizados)"
+    needs: package-arch
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Baixar Manifestos
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "pkg-manifest-*"
+          merge-multiple: true
+
+      - name: Diff amd64 x arm64
+        run: |
+          if [ ! -f manifest-amd64.txt ] || [ ! -f manifest-arm64.txt ]; then
+            echo "Manifestos ausentes (provável cache hit do pacote final); nada a comparar."
+            echo "Manifestos ausentes (cache hit do pacote final); nada a comparar." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          A=$(wc -l < manifest-amd64.txt)
+          B=$(wc -l < manifest-arm64.txt)
+          echo "amd64: $A entradas | arm64: $B entradas | diferença: $(( A - B ))"
+
+          diff manifest-amd64.txt manifest-arm64.txt > manifest.diff || true
+          ONLY_AMD=$(grep -c '^<' manifest.diff || true)
+          ONLY_ARM=$(grep -c '^>' manifest.diff || true)
+
+          {
+            echo "### Comparação de manifestos"
+            echo "| | Entradas |"
+            echo "|---|---|"
+            echo "| amd64 | $A |"
+            echo "| arm64 | $B |"
+            echo "| Só no amd64 | $ONLY_AMD |"
+            echo "| Só no arm64 | $ONLY_ARM |"
+            echo ""
+            echo "<details><summary>Diff completo (primeiras 300 linhas)</summary>"
+            echo ""
+            echo '```diff'
+            head -n 300 manifest.diff
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "--- Só no amd64 (primeiras 60) ---"
+          grep '^<' manifest.diff | head -n 60 || true
+          echo "--- Só no arm64 (primeiras 60) ---"
+          grep '^>' manifest.diff | head -n 60 || true
+
+      - name: Upload do Diff
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-diff
+          path: manifest.diff
+          retention-days: 7
+          if-no-files-found: ignore
 
   # ============================================================================
   # ESTÁGIO 4: Publica AMD64 e ARM64 + Script APT na Release
