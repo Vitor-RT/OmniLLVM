@@ -41,8 +41,8 @@ permissions:
 env:
   INSTALL_PREFIX: /opt/omnillvm
   # ==========================================================================
-  # VERSÕES OFICIAIS ESTÁVEIS FIXADAS:
-  # Swift 6.4.1 + LLVM 21 (swift/release/6.4.1) | Rust 1.94.0 | GNAT 27.1
+  # VERSÕES OFICIAIS ESTÁVEIS FIXADAS (PURE COMPILERS — ZERO PACKAGE MANAGERS):
+  # Swift 6.4.1 + LLVM 21 (swift/release/6.4.1) | Rustc 1.94.0 | GNAT 27.1 | Flang+flang-rt 21
   # ==========================================================================
   SWIFT_SCHEME: release/6.4.1
   SWIFT_LLVM_BRANCH: swift/release/6.4.1
@@ -50,12 +50,10 @@ env:
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
-  # Reutiliza os caches limpos já validados de Stage 1, Ada e Rust; recompila apenas o Flang sem libclang-cpp!
-  CORE_CACHE_REV: v2-clean-swift641
-  FRONTEND_CACHE_REV: v2-clean-r194-g271
-  ADA_CACHE_REV: v3-single-llvm-passregistry
-  FLANG_CACHE_REV: v4-flang-single-llvm
-  PACKAGE_CACHE_REV: v12-all-7-tests
+  # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
+  CORE_CACHE_REV: v11-hermetic-core
+  FRONTEND_CACHE_REV: v11-hermetic-frontends
+  PACKAGE_CACHE_REV: v11-hermetic-pkg
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -67,10 +65,11 @@ env:
 jobs:
   # ============================================================================
   # ESTÁGIO 1: Core em Container Ubuntu 26.04 (AMD64 + ARM64)
-  # Compila LLVM 21 + Clang + LLD + LLDB + Swift 6.4.1 + libdispatch Nativo
+  # Compila LLVM 21 + Clang + LLD + LLDB + Swiftc 6.4.1 + libdispatch + Runtimes Pure LLVM
+  # (Zero Swift Package Manager / Zero ferramentas de pacotes externos)
   # ============================================================================
   build-core:
-    name: "Stage 1: Core LLVM+Swift 6.4.1 [Ubuntu 26.04 - ${{ matrix.arch }}]"
+    name: "Stage 1: Core LLVM+Swiftc 6.4.1 [Ubuntu 26.04 - ${{ matrix.arch }}]"
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
@@ -120,8 +119,8 @@ jobs:
           apt-get install -y -qq --no-install-recommends \
             git cmake ninja-build make clang lld mold ccache patchelf curl \
             python3 pkg-config libncurses-dev libedit-dev \
-            libxml2-dev uuid-dev libicu-dev libsqlite3-dev \
-            libcurl4-openssl-dev libblocksruntime-dev zlib1g-dev xz-utils file procps
+            libxml2-dev uuid-dev libicu-dev \
+            libblocksruntime-dev zlib1g-dev xz-utils file procps
 
           apt-get remove -y libpython3*-dev swig* || true
           mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
@@ -161,14 +160,49 @@ jobs:
             omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
 
-      - name: 3. Clonar Swift 6.4.1 + LLVM 21 + libdispatch (release/6.4.1) em Paralelo
+      - name: 3. Clonar Swift 6.4.1 + LLVM 21 + libdispatch (Sem Repositórios de Gerenciadores de Pacotes)
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
           git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
+          # Pula o clone de repositórios de gerenciadores de pacotes (swiftpm, swift-driver externo, etc.) que não são necessários!
+          ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history \
+            --skip-repository swiftpm \
+            --skip-repository swift-driver \
+            --skip-repository swift-tools-support-core \
+            --skip-repository swift-argument-parser \
+            --skip-repository swift-crypto \
+            --skip-repository swift-certificates \
+            --skip-repository swift-asn1 \
+            --skip-repository swift-system \
+            --skip-repository swift-collections \
+            --skip-repository yams \
+            --skip-repository llbuild \
+            --skip-repository indexstore-db \
+            --skip-repository sourcekit-lsp \
+            --skip-repository swift-docc \
+            --skip-repository swift-docc-render-artifact \
+            --skip-repository swift-docc-symbolkit \
+            --skip-repository swift-markdown \
+            --skip-repository swift-cmark \
+            --skip-repository swift-format \
+            --skip-repository swift-testing \
+            --skip-repository swift-foundation \
+            --skip-repository swift-foundation-icu \
+            --skip-repository swift-corelibs-foundation \
+            --skip-repository swift-corelibs-xctest \
+            -j ${{ steps.hw.outputs.compile_jobs }} || \
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
 
-      - name: 4. Compilar Core 6.4.1 Enxuto (-O3 + libLLVM.so + libdispatch Nativo + Sem swift_static)
+          # Garante que swift-cmark (usado pelo parser interno do compilador Swift) exista
+          if [ ! -d "$GITHUB_WORKSPACE/src/cmark" ] && [ ! -d "$GITHUB_WORKSPACE/src/swift-cmark" ]; then
+            ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
+          fi
+          # Remove pastas de gerenciadores de pacotes (swiftpm / swift-driver) para garantir que o build-script
+          # use diretamente o driver C++ nativo embutido no swift-frontend (economizando tempo de build e dezenas de MB!)
+          rm -rf $GITHUB_WORKSPACE/src/swiftpm $GITHUB_WORKSPACE/src/swift-driver
+
+      - name: 4. Compilar e Configurar Core 6.4.1 Completo na Origem (LLVM + Clang + Swiftc + LLDB + Runtimes)
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           cd $GITHUB_WORKSPACE/src
@@ -250,7 +284,6 @@ jobs:
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
           DISPATCH_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "libdispatch-linux-*" | head -n 1)
-          EARLY_DRIVER_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "earlyswiftdriver-linux-*" | head -n 1)
 
           sed -i 's/#define LLVM_ENABLE_DYLIB 0/#define LLVM_ENABLE_DYLIB 1/g' \
             "$LLVM_BUILD_DIR/tools/llvm-config/BuildVariables.inc" || true
@@ -275,13 +308,18 @@ jobs:
           done
 
           mkdir -p "$TOOLCHAIN/bin" "$TOOLCHAIN/include" "$TOOLCHAIN/lib"
-          if [ -n "$EARLY_DRIVER_DIR" ]; then
-            find "$EARLY_DRIVER_DIR" -name "lib*.so*" -exec cp -af {} "$TOOLCHAIN/lib/" \; 2>/dev/null || true
-            if [ -f "$EARLY_DRIVER_DIR/release/bin/swift-driver" ]; then
-              cp -af "$EARLY_DRIVER_DIR/release/bin/swift-driver" "$TOOLCHAIN/bin/swift-driver"
-              ln -sf swift-driver "$TOOLCHAIN/bin/swift-driver-new"
-            fi
-          fi
+
+          # 3. Configura swift e swiftc diretamente sobre o swift-frontend (Zero dependência de SwiftPM / swift-driver externo!)
+          rm -f "$TOOLCHAIN/bin/swift-package"* "$TOOLCHAIN/bin/swift-build"* \
+                "$TOOLCHAIN/bin/swift-test"* "$TOOLCHAIN/bin/swift-run"* \
+                "$TOOLCHAIN/bin/swift-sdk"* "$TOOLCHAIN/bin/swift-experimental"* \
+                "$TOOLCHAIN/bin/swift-driver"* "$TOOLCHAIN/bin/swift-help"* 2>/dev/null || true
+          ln -sf swift-frontend "$TOOLCHAIN/bin/swift"
+          ln -sf swift-frontend "$TOOLCHAIN/bin/swiftc"
+          ln -sf swift-frontend "$TOOLCHAIN/bin/swift-symbolgraph-extract"
+          ln -sf swift-frontend "$TOOLCHAIN/bin/swift-autolink-extract"
+          ln -sf swift-frontend "$TOOLCHAIN/bin/swift-api-digester"
+
           cp -af "$LLVM_BUILD_DIR/lib/libLLVM"*".so"* "$TOOLCHAIN/lib/"
           cp -af "$LLVM_BUILD_DIR/lib/libclang"*".so"* "$TOOLCHAIN/lib/" || true
           cp -af "$LLVM_BUILD_DIR/bin/clang"* "$TOOLCHAIN/bin/"
@@ -296,13 +334,42 @@ jobs:
           cp -ru "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "$TOOLCHAIN/include/" 2>/dev/null || true
           cp -ru "$LLVM_BUILD_DIR/lib/cmake" "$TOOLCHAIN/lib/" 2>/dev/null || true
 
+          # 4. Garante headers completos da libc++ (incluindo __config_site) em include/c++/v1
+          CFG_SITE=$(find "$TOOLCHAIN/include" "$LLVM_BUILD_DIR" -name "__config_site" 2>/dev/null | head -n 1)
+          if [ -n "$CFG_SITE" ] && [ -d "$TOOLCHAIN/include/c++/v1" ]; then
+            cp -af "$CFG_SITE" "$TOOLCHAIN/include/c++/v1/__config_site" 2>/dev/null || true
+          fi
+
+          # 5. Expõe todas as bibliotecas .so do Swift e dos Runtimes LLVM diretamente em $TOOLCHAIN/lib
           find "$TOOLCHAIN/lib/swift" -name "*.so*" 2>/dev/null | while read -r f; do
             if [ ! -e "$TOOLCHAIN/lib/$(basename "$f")" ]; then
               ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
             fi
           done
+          find "$TOOLCHAIN/lib" -maxdepth 3 \( -name "libc++.so*" -o -name "libc++abi.so*" -o -name "libunwind.so*" \) | while read -r f; do
+            if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ]; then
+              ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
+            fi
+          done
 
+          # 6. Limpa '-latomic' dos linker scripts libc++.so e gera libatomic.so.1 ELF nativa a partir do compiler-rt
+          find "$TOOLCHAIN/lib" -name "libc++.so" -type f -exec sed -i 's/-latomic//g' {} + 2>/dev/null || true
+          find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" ! -name "libatomic.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
+
+          BUILTINS_A=$(find "$TOOLCHAIN" -name "libclang_rt.builtins*.a" | head -n 1)
+          if [ -n "$BUILTINS_A" ]; then
+            "$TOOLCHAIN/bin/clang" -shared -fuse-ld=lld -nostdlib \
+              -Wl,-soname,libatomic.so.1 \
+              -Wl,--whole-archive "$BUILTINS_A" -Wl,--no-whole-archive \
+              -lc -o "$TOOLCHAIN/lib/libatomic.so.1"
+            ln -sf libatomic.so.1 "$TOOLCHAIN/lib/libatomic.so"
+          fi
+
+          # 7. Remove bibliotecas estáticas internas (.a) e documentações desnecessárias já no Stage 1!
           rm -rf "$TOOLCHAIN/lib/swift_static" "$TOOLCHAIN/share/doc" "$TOOLCHAIN/share/man" "$TOOLCHAIN/share/info" 2>/dev/null || true
+          rm -f "$TOOLCHAIN/lib"/libLLVM*.a "$TOOLCHAIN/lib"/libclang*.a \
+                "$TOOLCHAIN/lib"/liblldb*.a "$TOOLCHAIN/lib"/liblld*.a 2>/dev/null || true
+
           ln -sfn . "$TOOLCHAIN/usr"
 
           "$TOOLCHAIN/bin/llvm-config" --link-shared --libs x86 aarch64 riscv
@@ -330,7 +397,7 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # ESTÁGIO 2: Matrix 3x2 Real (6 Jobs em Paralelo: Flang, Ada e Rust x AMD64/ARM64)
+  # ESTÁGIO 2: Matrix 3x2 Real (6 Jobs em Paralelo: Flang+flang-rt, Ada e Rustc x AMD64/ARM64)
   # ============================================================================
   build-parallel-frontends:
     name: "Stage 2: ${{ matrix.component }} [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -370,9 +437,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
-          key: omnillvm-overlay-tarball-${{ matrix.component == 'gnat-ada' && env.ADA_CACHE_REV || (matrix.component == 'flang-mlir' && env.FLANG_CACHE_REV || env.FRONTEND_CACHE_REV) }}-${{ matrix.component }}-${{ matrix.arch }}
+          key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
           restore-keys: |
-            omnillvm-overlay-tarball-${{ matrix.component == 'gnat-ada' && env.ADA_CACHE_REV || (matrix.component == 'flang-mlir' && env.FLANG_CACHE_REV || env.FRONTEND_CACHE_REV) }}-${{ matrix.component }}-${{ matrix.arch }}
+            omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
 
       - name: 1. Baixar Core SDK (${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
@@ -409,11 +476,11 @@ jobs:
             omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
           max-size: 2G
 
-      # --- 3A. Flang + MLIR Dinâmicos (-O3 + mold) [swift/release/6.4.1] ---
-      - name: 3A. Compilar Flang + MLIR Dinâmicos (Shared libLLVM.so — Sem Dupla PassRegistry!)
+      # --- 3A. Flang + MLIR + flang-rt (Suporte Completo a Fortran Standalone + Zero libquadmath) ---
+      - name: 3A. Compilar Flang + MLIR + flang-rt (Shared libLLVM.so + Zero libquadmath)
         if: matrix.component == 'flang-mlir' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends cmake ninja-build make clang lld mold ccache python3 zlib1g-dev
+          apt-get install -y -qq --no-install-recommends cmake ninja-build make clang lld mold ccache python3 zlib1g-dev patchelf
 
           export TMPDIR="/tmp"
 
@@ -424,11 +491,11 @@ jobs:
           git sparse-checkout set cmake llvm mlir flang clang third-party runtimes flang-rt compiler-rt
           git checkout
 
-          # CORREÇÃO DEFINITIVA DO CRASH "double free or corruption (!prev)" NO FLANG:
-          # 1. Usa CLANG_LINK_CLANG_DYLIB=OFF (para que o flang linke apenas com libLLVM.so e NUNCA com libclang-cpp.so,
-          #    evitando carregar a cópia estática do LLVM que existe dentro da libclang-cpp.so do Stage 1!)
-          # 2. Não exporta LD_LIBRARY_PATH="/opt/omnillvm/lib" durante o build do Flang para não misturar libs durante a geração dos .mod!
-          # 3. Alinha LLVM_VERSION_MINOR=0 com a libLLVM.so.21.0 do Core SDK!
+          # 1. Desativa permanentemente a detecção de libquadmath.so.0 do GCC no Flang e no flang-rt!
+          find flang flang-rt -name "CMakeLists.txt" -o -name "*.cmake" 2>/dev/null | \
+            xargs sed -i 's/check_library_exists(quadmath.*/set(HAVE_LIBQUADMATH OFF)/g; s/check_include_file(quadmath.h.*/set(HAVE_QUADMATH_H OFF)/g' 2>/dev/null || true
+
+          # 2. Compila Flang + MLIR + flang-rt (CENÁRIO A: Habilita libflang_rt.runtime.a para programas 100% Fortran standalone!)
           cmake -G Ninja -S llvm -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${{ env.MAX_OPT_FLAGS }}" \
@@ -448,11 +515,16 @@ jobs:
             -DCLANG_VERSION_MAJOR=21 \
             -DCLANG_VERSION_MINOR=0 \
             -DCLANG_VERSION_PATCH=0 \
+            -DHAVE_LIBQUADMATH=OFF \
+            -DHAVE_QUADMATH_H=OFF \
+            -DFLANG_RUNTIME_F128_MATH_LIB="" \
+            -DFLANG_RT_ENABLE_SHARED=ON \
+            -DFLANG_RT_ENABLE_STATIC=ON \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_TARGETS_TO_BUILD="X86;AArch64;RISCV" \
             -DLLVM_ENABLE_PROJECTS="clang;mlir;flang" \
-            -DLLVM_ENABLE_RUNTIMES="" \
-            -DFLANG_ENABLE_FLANG_RT=OFF \
+            -DLLVM_ENABLE_RUNTIMES="flang-rt" \
+            -DFLANG_ENABLE_FLANG_RT=ON \
             -DLLVM_USE_LINKER=mold \
             -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
             -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
@@ -470,14 +542,33 @@ jobs:
             -DMLIR_INCLUDE_TESTS=OFF
 
           ninja -C build -j ${{ steps.hw.outputs.compile_jobs }} tools/flang/install
+          ninja -C build -j ${{ steps.hw.outputs.compile_jobs }} runtimes || true
+          if [ -d "build/runtimes/runtimes-bins" ]; then
+            ninja -C build/runtimes/runtimes-bins install || true
+          fi
+
+          mkdir -p /opt/overlay-install/lib
           cp -a build/lib/libFortran* "/opt/overlay-install/lib/" 2>/dev/null || true
           cp -a build/lib/libMLIR* "/opt/overlay-install/lib/" 2>/dev/null || true
           cp -a build/lib/libflang* "/opt/overlay-install/lib/" 2>/dev/null || true
-          rm -f /opt/overlay-install/lib/*.a
+
+          # Copia libflang_rt.runtime.a e .so para /opt/overlay-install/lib e para o resource-dir do Clang/Flang (lib/clang/21/lib/...)
+          find build -name "libflang_rt*" -o -name "libFortran*" | while read -r rtfile; do
+            cp -af "$rtfile" /opt/overlay-install/lib/ 2>/dev/null || true
+            mkdir -p "/opt/overlay-install/lib/clang/21/lib/${{ matrix.rust_triple }}" "/opt/overlay-install/lib/clang/21/lib/linux"
+            cp -af "$rtfile" "/opt/overlay-install/lib/clang/21/lib/${{ matrix.rust_triple }}/" 2>/dev/null || true
+            cp -af "$rtfile" "/opt/overlay-install/lib/clang/21/lib/linux/" 2>/dev/null || true
+          done
+
+          # Remove apenas as bibliotecas estáticas internas do compilador (preservando libflang_rt.runtime.a e libFortran*.a!)
+          rm -f /opt/overlay-install/lib/libLLVM*.a \
+                /opt/overlay-install/lib/libclang*.a \
+                /opt/overlay-install/lib/libMLIR*.a \
+                /opt/overlay-install/lib/libflang*.a
           rm -rf /opt/overlay-install/share/doc /opt/overlay-install/share/man 2>/dev/null || true
 
       # --- 3B. GNAT-LLVM (Ada) [release/27.1 Fixo Estável para LLVM 21] ---
-      - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico (Shared libLLVM.so — Sem Dupla PassRegistry!)
+      - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico (Shared libLLVM.so + RTS v16 Completa na Origem)
         if: matrix.component == 'gnat-ada' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends make build-essential gprbuild cmake ninja-build clang lld mold ccache python3 zlib1g-dev
@@ -548,6 +639,7 @@ jobs:
             PREFIX="/opt/overlay-install" \
             build
 
+          # CONFIGURAÇÃO PERMANENTE E COMPLETA DA RTS DO ADA NO STAGE 2:
           mkdir -p /opt/overlay-install/bin /opt/overlay-install/lib/rts-native/adalib /opt/overlay-install/lib/rts-native/adainclude
           cp -af llvm-interface/bin/* /opt/overlay-install/bin/
           ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
@@ -555,17 +647,28 @@ jobs:
           cp -af "$ADA_LIB_DIR/"*.ali /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
           sed -i '1s/GNAT Lib v15/GNAT Lib v16/' /opt/overlay-install/lib/rts-native/adalib/*.ali 2>/dev/null || true
           cp -af "$ADA_INC_DIR/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
+
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat.so
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat-${GNAT_VER}.so
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnarl.so
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnarl-${GNAT_VER}.so
+          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/libgnat.so
+          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/libgnat-${GNAT_VER}.so
+          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/libgnarl.so
+          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/libgnarl-${GNAT_VER}.so
+
+          ln -sfn lib/rts-native /opt/overlay-install/rts-native
+          ln -sfn rts-native/adainclude /opt/overlay-install/lib/adainclude
+          ln -sfn rts-native/adalib /opt/overlay-install/lib/adalib
+          ln -sfn lib/rts-native/adainclude /opt/overlay-install/adainclude
+          ln -sfn lib/rts-native/adalib /opt/overlay-install/adalib
           ls -la /opt/overlay-install/bin/
 
-      # --- 3C. Rustc 1.94.0 + Cargo Dinâmicos (-O3 + mold + LLVM 21) ---
-      - name: 3C. Compilar Rustc 1.94.0 Dinâmico (link-shared = true + mold)
+      # --- 3C. Apenas Rustc 1.94.0 + Stdlib Dinâmicos (ZERO Cargo / ZERO Package Manager!) ---
+      - name: 3C. Compilar Apenas Rustc 1.94.0 + Stdlib (Sem Cargo + link-shared = true + mold)
         if: matrix.component == 'rust' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends make build-essential cmake ninja-build clang mold lld ccache python3 curl pkg-config libssl-dev zlib1g-dev
+          apt-get install -y -qq --no-install-recommends make build-essential cmake ninja-build clang mold lld ccache python3 curl pkg-config zlib1g-dev
 
           export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
           export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:$LD_LIBRARY_PATH"
@@ -580,6 +683,8 @@ jobs:
             sed -i 's/"", "", "", FS,/"", "", "",/g' compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp || true
           fi
 
+          # extended = false e tools = [] garante que APENAS o compilador rustc e a libstd sejam compilados
+          # (Zero compilação do Cargo ou qualquer gerenciador de pacotes externo!)
           cat <<EOF > bootstrap.toml
           change-id = "ignore"
 
@@ -595,8 +700,8 @@ jobs:
           jobs = ${{ steps.hw.outputs.compile_jobs }}
           docs = false
           compiler-docs = false
-          extended = true
-          tools = ["cargo"]
+          extended = false
+          tools = []
           ccache = "ccache"
 
           [install]
@@ -635,7 +740,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
-          key: omnillvm-overlay-tarball-${{ matrix.component == 'gnat-ada' && env.ADA_CACHE_REV || (matrix.component == 'flang-mlir' && env.FLANG_CACHE_REV || env.FRONTEND_CACHE_REV) }}-${{ matrix.component }}-${{ matrix.arch }}
+          key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
 
       - name: Upload do Overlay (${{ matrix.component }}-${{ matrix.arch }})
         uses: actions/upload-artifact@v4
@@ -646,7 +751,7 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # ESTÁGIO 3: Fusão 100% Pure Swift-LLVM + Delegação de Libs de SO para APT + Testes
+  # ESTÁGIO 3: Fusão Limpa, RPATH ($ORIGIN), Deduplicação, Strip e Suíte de Testes
   # ============================================================================
   package-arch:
     name: "Stage 3: Merge, Strip & Tests [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -692,15 +797,15 @@ jobs:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar (100% Swift-LLVM Runtimes), Configurar RTS Padrão do Ada e Linker Scripts
+      - name: 1. Unificar Árvore, Ativar clang.cfg Pure LLVM, Deduplicar e Aplicar Strip Cirúrgico
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils libc6-dev
+          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils
 
           CORES=$(nproc --all)
           mkdir -p /opt
 
-          # 1. Extrai a Base e os 3 Overlays na mesma árvore
+          # 1. Extrai a Base (Stage 1) e os 3 Overlays (Stage 2) na mesma árvore
           tar -I "zstd -T0" -xf artifacts/core-sdk-${{ matrix.arch }}/core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
           rm -f "${{ env.INSTALL_PREFIX }}/usr" || true
           for comp in flang-mlir gnat-ada rust; do
@@ -711,32 +816,12 @@ jobs:
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
           STRIP="$TOOLCHAIN/bin/llvm-strip"
 
-          # 2. Limpeza de qualquer documentação ou arquivo estático residual
-          rm -rf "$TOOLCHAIN/lib/swift_static" \
-                 "$TOOLCHAIN/share/doc" \
-                 "$TOOLCHAIN/share/man" \
-                 "$TOOLCHAIN/share/info" 2>/dev/null || true
+          # Garante que nenhum binário de gerenciador de pacotes (cargo, swift-package, etc.) exista na árvore final
+          rm -f "$TOOLCHAIN/bin/cargo"* "$TOOLCHAIN/bin/swift-package"* \
+                "$TOOLCHAIN/bin/swift-build"* "$TOOLCHAIN/bin/swift-test"* \
+                "$TOOLCHAIN/bin/swift-run"* "$TOOLCHAIN/bin/swift-sdk"* 2>/dev/null || true
 
-          if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
-            sed -i '1s/GNAT Lib v15/GNAT Lib v16/' "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
-            ln -sfn lib/rts-native "$TOOLCHAIN/rts-native"
-            ln -sfn rts-native/adainclude "$TOOLCHAIN/lib/adainclude"
-            ln -sfn rts-native/adalib "$TOOLCHAIN/lib/adalib"
-            ln -sfn lib/rts-native/adainclude "$TOOLCHAIN/adainclude"
-            ln -sfn lib/rts-native/adalib "$TOOLCHAIN/adalib"
-          fi
-
-          if [ -x "$TOOLCHAIN/bin/swift-frontend" ] && ldd "$TOOLCHAIN/bin/swiftc" 2>/dev/null | grep -q "not found"; then
-            rm -f "$TOOLCHAIN/bin/swift-driver" "$TOOLCHAIN/bin/swift-help" 2>/dev/null || true
-            ln -sf swift-frontend "$TOOLCHAIN/bin/swift"
-            ln -sf swift-frontend "$TOOLCHAIN/bin/swiftc"
-            ln -sf swift-frontend "$TOOLCHAIN/bin/swift-symbolgraph-extract"
-            ln -sf swift-frontend "$TOOLCHAIN/bin/swift-autolink-extract"
-            ln -sf swift-frontend "$TOOLCHAIN/bin/swift-api-digester"
-          fi
-
-          # 3. PURE SWIFT-LLVM CONFIG: Configura Clang, Clang++, Swiftc, Rustc e GNAT para usarem
-          # nativamente os runtimes compiler-rt, libunwind, libc++ e ld.lld do nosso Swift-LLVM 6.4.1!
+          # 2. Ativa os symlinks finais do compiler-rt/libunwind e clang.cfg/clang++.cfg para distribuição Pure LLVM
           CRTBEGIN_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtbegin*.o" | head -n 1)
           if [ -n "$CRTBEGIN_FILE" ]; then
             CRT_DIR=$(dirname "$CRTBEGIN_FILE")
@@ -750,39 +835,12 @@ jobs:
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc.a"
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libgcc_eh.a"
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libatomic.a"
-              "$TOOLCHAIN/bin/clang" -shared -fuse-ld=lld -nostdlib \
-                -Wl,-soname,libatomic.so.1 \
-                -Wl,--whole-archive "$BUILTINS_A" -Wl,--no-whole-archive \
-                -lc -o "$TOOLCHAIN/lib/libatomic.so.1"
-              ln -sf libatomic.so.1 "$TOOLCHAIN/lib/libatomic.so"
             fi
           fi
-
-          find "$TOOLCHAIN/lib" -name "libc++.so" -type f -exec sed -i 's/-latomic//g' {} + 2>/dev/null || true
-
-          find "$TOOLCHAIN/lib" -maxdepth 3 \( -name "libc++.so*" -o -name "libc++abi.so*" -o -name "libunwind.so*" \) | while read -r f; do
-            if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ]; then
-              ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
-            fi
-          done
-
-          find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" ! -name "libatomic.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
           if [ -e "$TOOLCHAIN/lib/libunwind.so" ]; then
             echo "GROUP ( libunwind.so.1 libgcc.a -lc )" > "$TOOLCHAIN/lib/libgcc_s.so"
             echo "INPUT ( libunwind.so.1 )" > "$TOOLCHAIN/lib/libunwind.a"
           fi
-
-          # Symlinks de compatibilidade 21.1 -> 21.0 para garantir que qualquer binário encontre libclang-cpp e libLLVM
-          [ -e "$TOOLCHAIN/lib/libclang-cpp.so.21.0" ] && ln -sf libclang-cpp.so.21.0 "$TOOLCHAIN/lib/libclang-cpp.so.21.1"
-          [ -e "$TOOLCHAIN/lib/libLLVM.so.21.0" ] && ln -sf libLLVM.so.21.0 "$TOOLCHAIN/lib/libLLVM.so.21.1"
-
-          FAKE_GCC_DIR="$TOOLCHAIN/lib/gcc/${{ matrix.gnu_triple }}/15"
-          mkdir -p "$FAKE_GCC_DIR"
-          for item in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libunwind.a libatomic.a libatomic.so libatomic.so.1; do
-            [ -e "$TOOLCHAIN/lib/$item" ] && ln -sf "$TOOLCHAIN/lib/$item" "$FAKE_GCC_DIR/$item"
-          done
-          ln -sfn "$TOOLCHAIN/lib/rts-native/adainclude" "$FAKE_GCC_DIR/adainclude"
-          ln -sfn "$TOOLCHAIN/lib/rts-native/adalib" "$FAKE_GCC_DIR/adalib"
 
           cat << 'EOF' > "$TOOLCHAIN/bin/clang.cfg"
           --rtlib=compiler-rt
@@ -803,7 +861,14 @@ jobs:
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
 
-          # 4. Gera o script install-ubuntu26.04-deps.sh com pacotes 100% existentes no Ubuntu 26.04!
+          cat << 'EOF' > "$TOOLCHAIN/bin/flang.cfg"
+          -fuse-ld=lld
+          -B<CFGDIR>/../lib
+          -L<CFGDIR>/../lib
+          -Wl,-rpath,<CFGDIR>/../lib
+          EOF
+
+          # 3. Gera o script oficial install-ubuntu26.04-deps.sh dentro da toolchain (Enxuto — Sem curl/ssl de gerenciadores de pacotes!)
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
           set -euo pipefail
@@ -812,16 +877,14 @@ jobs:
           else
             SUDO=""
           fi
-          echo "📦 Instalando bibliotecas dinâmicas de sistema do Ubuntu 26.04 para o OmniLLVM (Zero GCC / Zero conflito LLVM)..."
+          echo "📦 Instalando bibliotecas dinâmicas nativas de sistema do Ubuntu 26.04 para o OmniLLVM (Zero GCC / Zero Package Managers)..."
           export DEBIAN_FRONTEND=noninteractive
           $SUDO apt-get update -qq
           $SUDO apt-get install -y --no-install-recommends \
-            ca-certificates pkg-config \
             libc6-dev \
             libedit2 libncurses6 libncurses-dev libtinfo6 \
             zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 \
-            libicu78 libsqlite3-0 libcurl4t64 libxml2-16 \
-            libssl3t64 libssl-dev \
+            libicu78 libxml2-16 \
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
 
@@ -837,24 +900,18 @@ jobs:
           EOF
           chmod +x "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
 
-          # 5. Garante symlinks em $TOOLCHAIN/lib para todas as bibliotecas .so dentro de $TOOLCHAIN/lib/swift/
-          find "$TOOLCHAIN/lib/swift" -name "*.so*" 2>/dev/null | while read -r f; do
-            if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ] && [ ! -e "$TOOLCHAIN/lib/$(basename "$f")" ]; then
-              ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
-            fi
-          done
-
-          # 6. Aplica RPATH relativo completo ($ORIGIN) em todos os binários e libs próprias da toolchain
+          # 4. Aplica RPATH relativo completo ($ORIGIN) em todos os binários e libs próprias da toolchain
           find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
             xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN/../lib/swift/host:$ORIGIN/../lib/swift/host/compiler:$ORIGIN' 2>/dev/null || true
 
           find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
             xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN:$ORIGIN/swift/linux:$ORIGIN/swift/host:$ORIGIN/swift/host/compiler:$ORIGIN/..:$ORIGIN/../..' 2>/dev/null || true
 
-          # 7. Deduplicação física por Symlinks Relativos
+          # 5. Deduplicação física por Symlinks Relativos
           rdfind -makesymlinks true -makeresultsfile false "$TOOLCHAIN"
           symlinks -cr "$TOOLCHAIN"
 
+          # Preserva os symlinks externos para a libgnat-15 do Ubuntu (após symlinks -cr)
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat-15.so"
@@ -866,20 +923,14 @@ jobs:
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/libgnarl.so"
           fi
 
-          # 8. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
+          # 6. Strip Cirúrgico em Paralelo (Preserva DWARF dos runtimes de linguagem)
           find "$TOOLCHAIN/bin" -type f -print0 | xargs -0 -n 10 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
           find "$TOOLCHAIN/lib" -maxdepth 1 -type f \( \
             -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" -o \
             -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
           \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
 
-          # 9. Remove TODAS as bibliotecas estáticas (.a) internas do compilador
-          rm -f "$TOOLCHAIN/lib"/libLLVM*.a "$TOOLCHAIN/lib"/libclang*.a \
-                "$TOOLCHAIN/lib"/libMLIR*.a "$TOOLCHAIN/lib"/libFortran*.a \
-                "$TOOLCHAIN/lib"/liblldb*.a "$TOOLCHAIN/lib"/libflang*.a \
-                "$TOOLCHAIN/lib"/liblld*.a
-
-      - name: "🧪 2. Provar Ambiente 100% Sem GCC/LLVM-APT + Executar Suíte Industrial de Testes (${{ matrix.arch }})"
+      - name: "🧪 2. Auditoria ELF Global (Cenários A e B) + Suíte Industrial de 7 Testes (${{ matrix.arch }})"
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
@@ -901,22 +952,29 @@ jobs:
           cd "$TEST_DIR"
 
           echo "===================================================================="
-          echo "🧪 INICIANDO AUDITORIA 100% PURE SWIFT-LLVM (ZERO GCC NO SISTEMA!)"
+          echo "🧪 INICIANDO AUDITORIA 100% PURE SWIFT-LLVM (CENÁRIOS A & B INCLUSOS)"
           echo "===================================================================="
 
-          # [1/7] Auditoria anti-libpython e resolução de bibliotecas no LLDB
-          echo "-> [1/7] Verificando dependências dinâmicas do LLDB no Ubuntu 26.04..."
-          ldd "$TOOLCHAIN/bin/lldb"
+          # [1/7] CENÁRIO B: Varredura Global de ldd em TODOS os executáveis e TODAS as .so da toolchain!
+          echo "-> [1/7] Varrendo TODOS os binários e bibliotecas ELF da toolchain contra 'not found' e 'libpython'..."
           if ldd "$TOOLCHAIN/bin/lldb" "$TOOLCHAIN/lib/liblldb.so"* | grep -q "libpython"; then
             echo "❌ ERRO FATAL: libpython encontrada no LLDB (${{ matrix.arch }})!"
             exit 1
           fi
-          if ldd "$TOOLCHAIN/bin/lldb" | grep -q "not found"; then
-            echo "❌ ERRO FATAL: Bibliotecas ausentes (not found) no LLDB (${{ matrix.arch }})!"
-            ldd "$TOOLCHAIN/bin/lldb" | grep "not found"
+          BROKEN_ELFS=0
+          for elf in $(find "$TOOLCHAIN/bin" "$TOOLCHAIN/lib" -type f \( -executable -o -name "*.so*" \) -exec file {} + | awk -F: '/ELF/ {print $1}'); do
+            MISSING=$(ldd "$elf" 2>/dev/null | grep "not found" || true)
+            if [ -n "$MISSING" ]; then
+              echo "❌ Dependência ausente em $elf:"
+              echo "$MISSING"
+              BROKEN_ELFS=1
+            fi
+          done
+          if [ "$BROKEN_ELFS" -ne 0 ]; then
+            echo "❌ ERRO FATAL: Foram encontradas bibliotecas ausentes na varredura global ELF!"
             exit 1
           fi
-          echo "✅ [1/7] LLDB 100% livre de libpython e com 100% das bibliotecas resolvidas!"
+          echo "✅ [1/7] Varredura ELF Global 100% Limpa: Zero 'not found' em toda a árvore /opt/omnillvm!"
 
           # [2/7] Teste C23 + C++23 usando 100% Swift-LLVM (compiler-rt + libc++ + libunwind + ld.lld)
           echo "-> [2/7] Testando Clang/Clang++ Pure Swift-LLVM (compiler-rt + libc++ + libunwind + lld)..."
@@ -944,8 +1002,8 @@ jobs:
           "$TOOLCHAIN/bin/clang" -O3 -c test_c.c -o test_c.o
           "$TOOLCHAIN/bin/clang++" -O3 -std=c++23 -c test_cpp.cpp -o test_cpp.o
 
-          # [3/7] Teste Rust 1.94.0 (FFI Staticlib + Executável Nativo Multi-thread sem GCC)
-          echo "-> [3/7] Testando Rustc 1.94.0 Pure LLVM (FFI + Stdlib Threads sem GCC)..."
+          # [3/7] Teste Rustc 1.94.0 (Sem Cargo — Compilação direta de staticlib FFI e binário multi-thread)
+          echo "-> [3/7] Testando Rustc 1.94.0 Pure LLVM (FFI + Stdlib Threads sem GCC e sem Cargo)..."
           cat << 'EOF' > test_rust_ffi.rs
           #[no_mangle]
           pub extern "C" fn rust_mul(a: i32, b: i32) -> i32 { a * b }
@@ -959,20 +1017,20 @@ jobs:
           fn main() {
               let h = thread::spawn(|| (1..=10).sum::<i32>());
               assert_eq!(h.join().unwrap(), 55);
-              println!("✅ [3/7] Rust 1.94.0 Runtime & Threads OK (Linkado via Clang/LLD sem GCC)!");
+              println!("✅ [3/7] Rustc 1.94.0 Runtime & Threads OK (Linkado via Clang/LLD sem GCC)!");
           }
           EOF
           "$TOOLCHAIN/bin/rustc" -O -C linker="$TOOLCHAIN/bin/clang" -C link-arg=-L"$TOOLCHAIN/lib" test_rust_bin.rs -o test_rust_bin
           ./test_rust_bin
 
-          # [4/7] Teste Swift 6.4.1 (swiftc + libswiftCore.so + libdispatch.so + clang/lld)
-          echo "-> [4/7] Testando Swift 6.4.1 (swiftc + libswiftCore.so + libdispatch.so)..."
+          # [4/7] Teste Swiftc 6.4.1 (swiftc + libswiftCore.so + libdispatch.so + clang/lld)
+          echo "-> [4/7] Testando Swiftc 6.4.1 (swiftc + libswiftCore.so + libdispatch.so)..."
           cat << 'EOF' > test_swift.swift
           import Dispatch
           struct Point { var x: Int; var y: Int }
           let p = Point(x: 20, y: 22)
           assert(p.x + p.y == 42)
-          print("✅ [4/7] Swift 6.4.1 Runtime, Stdlib & libdispatch OK: \(p.x + p.y)")
+          print("✅ [4/7] Swiftc 6.4.1 Runtime, Stdlib & libdispatch OK: \(p.x + p.y)")
           EOF
           "$TOOLCHAIN/bin/swiftc" -O -use-ld=lld test_swift.swift -L"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin
           ./test_swift_bin
@@ -992,8 +1050,22 @@ jobs:
           "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb -largs -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
           ./hello_ada
 
-          # [6/7] Teste Fortran Flang 21 (ISO_C_BINDING ABI com Clang Pure LLVM)
-          echo "-> [6/7] Testando Fortran Flang 21 (ISO_C_BINDING ABI)..."
+          # [6/7] CENÁRIO A: Teste Fortran Flang 21 (100% Standalone com flang-rt I/O + ISO_C_BINDING ABI)
+          echo "-> [6/7] Testando Fortran Flang 21 (Executável 100% Fortran Standalone com flang-rt + ISO_C_BINDING)..."
+          FLANG_BIN=$(ls "$TOOLCHAIN/bin/flang" "$TOOLCHAIN/bin/flang-new" 2>/dev/null | head -n 1)
+          cat << 'EOF' > hello_standalone.f90
+          program hello_fortran
+            implicit none
+            integer :: a, b
+            a = 20
+            b = 22
+            if (a + b /= 42) stop 1
+            print '(A,I2)', "✅ [6A/7] Fortran 100% Standalone (flang-rt I/O) OK: ", a + b
+          end program hello_fortran
+          EOF
+          "$FLANG_BIN" -O3 hello_standalone.f90 -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib" -o hello_standalone
+          ./hello_standalone
+
           cat << 'EOF' > test_fortran.f90
           pure integer function fort_square(x) bind(c, name="fort_square")
             use iso_c_binding, only: c_int
@@ -1001,14 +1073,13 @@ jobs:
             fort_square = x * x
           end function fort_square
           EOF
-          FLANG_BIN=$(ls "$TOOLCHAIN/bin/flang" "$TOOLCHAIN/bin/flang-new" 2>/dev/null | head -n 1)
           "$FLANG_BIN" -O3 -c test_fortran.f90 -o test_fortran.o
           cat << 'EOF' > test_fort_main.c
           #include <stdio.h>
           extern int fort_square(int x);
           int main() {
               if (fort_square(7) != 49) return 1;
-              printf("✅ [6/7] Fortran (Flang 21 ISO_C_BINDING) ABI OK: %d\n", fort_square(7));
+              printf("✅ [6B/7] Fortran (Flang 21 ISO_C_BINDING) ABI OK: %d\n", fort_square(7));
               return 0;
           }
           EOF
@@ -1022,7 +1093,7 @@ jobs:
 
           cd /opt && rm -rf "$TEST_DIR"
           echo "===================================================================="
-          echo "🎉 TODOS OS 7 TESTES PASSARAM COM 100% SWIFT-LLVM E 0% GCC!"
+          echo "🎉 TODOS OS 7 TESTES (INCLUINDO CENÁRIOS A E B) PASSARAM COM 100%!"
           echo "===================================================================="
 
       - name: 3. Compactar Pacote Final com ZSTD Nível 19 Multi-Thread (${{ matrix.arch }})
@@ -1081,7 +1152,7 @@ jobs:
             fi
           fi
 
-          # Gera o script standalone install-ubuntu26.04-deps.sh
+          # Gera o script standalone install-ubuntu26.04-deps.sh (Enxuto — Sem libs de gerenciadores de pacotes)
           cat << 'EOF' > install-ubuntu26.04-deps.sh
           #!/usr/bin/env bash
           set -euo pipefail
@@ -1090,16 +1161,14 @@ jobs:
           else
             SUDO=""
           fi
-          echo "📦 Instalando bibliotecas dinâmicas de sistema do Ubuntu 26.04 para o OmniLLVM (Zero GCC / Zero conflito LLVM)..."
+          echo "📦 Instalando bibliotecas dinâmicas nativas de sistema do Ubuntu 26.04 para o OmniLLVM (Zero GCC / Zero Package Managers)..."
           export DEBIAN_FRONTEND=noninteractive
           $SUDO apt-get update -qq
           $SUDO apt-get install -y --no-install-recommends \
-            ca-certificates pkg-config \
             libc6-dev \
             libedit2 libncurses6 libncurses-dev libtinfo6 \
             zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 \
-            libicu78 libsqlite3-0 libcurl4t64 libxml2-16 \
-            libssl3t64 libssl-dev \
+            libicu78 libxml2-16 \
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
 
@@ -1130,7 +1199,7 @@ jobs:
           name: "OmniLLVM Unified Toolchain - Release ${{ steps.meta.outputs.tag }} [Ubuntu 26.04 | AMD64 & ARM64]"
           body: |
             ### OmniLLVM Unified Toolchain — Ubuntu 26.04 LTS (`amd64` & `arm64`)
-            Toolchain **100% Pure Swift-LLVM** (Zero dependência de `gcc`, `libgcc-dev` ou `libstdc++-dev`), unificando `libLLVM.so` 21 (`swift/release/6.4.1`), `compiler-rt`, `libc++`, `libunwind`, `libdispatch` e `ld.lld` para **C, C++, Fortran (Flang), Ada (GNAT 27.1), Rust (1.94.0) e Swift (6.4.1)**.
+            Toolchain **100% Pure Swift-LLVM Hermética** (Zero dependência de `gcc`, `libgcc-dev`, `libstdc++-dev` e zero gerenciadores de pacotes externos), unificando `libLLVM.so` 21 (`swift/release/6.4.1`), `compiler-rt`, `libc++`, `libunwind`, `libdispatch`, `flang-rt` e `ld.lld` para **C, C++, Fortran (Flang), Ada (GNAT 27.1), Rust (Rustc 1.94.0) e Swift (Swiftc 6.4.1)**.
 
             #### 1. Extrair em `/opt/omnillvm` e instalar dependências de sistema do Ubuntu 26.04 (Sem GCC):
             ```bash
