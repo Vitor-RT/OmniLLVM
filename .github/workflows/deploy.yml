@@ -57,7 +57,7 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v20-swift-641-libcxx-probe
+  CORE_CACHE_REV: v21-swift-641-libcxx-bitfix
   FRONTEND_CACHE_REV: v13-gnat-clang-cpp-libcxx-unwindfix
   PACKAGE_CACHE_REV: v13-audit-manifest
   DEBIAN_FRONTEND: noninteractive
@@ -189,16 +189,14 @@ jobs:
           echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------------------
-      # Diagnóstico + sondagem da libc++ do sistema.
-      # O build do LLVM falhou com "no member named '__libcpp_ctz/__libcpp_clz' in namespace 'std'"
-      # ao incluir <vector>/<charconv> da libc++ do Ubuntu. Aqui:
-      #   1) listamos pacotes/headers (para o log mostrar a causa real);
-      #   2) compilamos um teste com -stdlib=libc++;
-      #   3) se falhar, tentamos um header de force-include (countr/countl);
-      #   4) se ainda falhar, abortamos cedo com o log completo.
-      # O flag escolhido vai para LIBCXX_FIX_FLAG (vazio quando não precisa).
+      # Correção da libc++ do sistema (erro "__libcpp_ctz/__libcpp_clz" não declarado).
+      # Os headers do pacote libc++-dev usam __libcpp_ctz (sort.h, __bit_reference) sem
+      # incluir __bit/countr.h. Aplicamos DUAS correções, sempre:
+      #   (a) patch nos headers do sistema (vale para qualquer compilador do job);
+      #   (b) force-include via flag (LIBCXX_FIX_FLAG).
+      # A sondagem só VALIDA o resultado (cobre <algorithm>, sort, nth_element, vector<bool>).
       # ----------------------------------------------------------------------
-      - name: 1B. Diagnóstico e Sondagem da libc++ do Sistema
+      - name: 1B. Corrigir e Validar a libc++ do Sistema
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           echo "--- pacotes relacionados:"
@@ -206,11 +204,20 @@ jobs:
           clang++ --version
           echo "--- diretórios c++/v1 encontrados:"
           find /usr -type d -path '*include/c++/v1' 2>/dev/null || true
-          echo "--- onde __libcpp_ctz/__libcpp_clz são definidos:"
-          grep -rln "__libcpp_ctz\|__libcpp_clz" /usr/lib/llvm-21/include/c++/v1 2>/dev/null | head -n 20 || true
-          echo "--- includes do __bit_reference:"
-          grep -n "#\s*include" /usr/lib/llvm-21/include/c++/v1/__bit_reference 2>/dev/null | head -n 40 || true
 
+          # (a) Patch nos headers do sistema
+          CFG=$(find /usr -path '*include/c++/v1/__config' 2>/dev/null | head -n 1)
+          test -n "$CFG" || { echo "ERRO: __config da libc++ não encontrado" >&2; exit 1; }
+          LIBCXX_INC=$(dirname "$CFG")
+          echo "libc++ headers em: $LIBCXX_INC"
+          for f in "$LIBCXX_INC/__bit_reference" "$LIBCXX_INC/__algorithm/sort.h"; do
+            if [ -f "$f" ] && ! grep -q '__bit/countr.h' "$f"; then
+              echo "Aplicando patch em $f"
+              sed -i '0,/#include <__config>/s//#include <__config>\n#include <__bit\/countr.h>\n#include <__bit\/countl.h>/' "$f"
+            fi
+          done
+
+          # (b) Header de force-include
           FIX_DIR=/usr/local/share/omnillvm-fix
           FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
           mkdir -p "$FIX_DIR"
@@ -226,30 +233,29 @@ jobs:
           EOF
 
           cat > /tmp/libcxx_probe.cpp << 'EOF'
+          #include <algorithm>
           #include <vector>
           #include <string>
           #include <charconv>
           #include <functional>
+          #include <bitset>
           int main() {
             std::vector<bool> v(10);
+            std::vector<int> a(1000);
+            std::sort(a.begin(), a.end());
+            std::nth_element(a.begin(), a.begin() + 10, a.end());
             char b[32];
             std::to_chars(b, b + 32, 12345);
             return v[0] ? 1 : 0;
           }
           EOF
 
-          if clang++ -std=c++17 -stdlib=libc++ -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe1.log; then
-            echo "✅ libc++ do sistema OK sem ajustes."
-            echo "LIBCXX_FIX_FLAG=" >> $GITHUB_ENV
-          elif clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe2.log; then
-            echo "⚠️ libc++ do sistema só compila com o force-include ($FIX_HDR). Aplicando workaround."
-            echo "--- erro original:"; head -n 20 /tmp/probe1.log || true
+          if clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe2.log; then
+            echo "✅ libc++ do sistema OK (patch de headers + force-include $FIX_HDR)."
             echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
           else
-            echo "❌ libc++ do sistema está inconsistente e o workaround não resolveu." >&2
-            echo "--- erro sem workaround:" >&2; cat /tmp/probe1.log >&2 || true
-            echo "--- erro com workaround:" >&2; cat /tmp/probe2.log >&2 || true
-            echo "Sugestão: fixar versões (libc++-21-dev libc++abi-21-dev) ou compilar o host com libstdc++ só no bootstrap." >&2
+            echo "❌ libc++ do sistema inconsistente mesmo com patch e force-include." >&2
+            cat /tmp/probe2.log >&2 || true
             exit 1
           fi
 
@@ -325,7 +331,7 @@ jobs:
           export CC=/usr/bin/clang
           export CXX=/usr/bin/clang++
           export CFLAGS="${{ env.MAX_OPT_FLAGS }}"
-          # LIBCXX_FIX_FLAG vem do passo 1B (vazio ou "-include <header>").
+          # LIBCXX_FIX_FLAG vem do passo 1B ("-include <header>").
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }} -stdlib=libc++ ${LIBCXX_FIX_FLAG:-}"
           export TMPDIR="/tmp"
           echo "LIBCXX_FIX_FLAG='${LIBCXX_FIX_FLAG:-}'"
@@ -622,12 +628,25 @@ jobs:
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
           "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
 
-      - name: 1B. Sondagem da libc++ do Sistema (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 1B. Corrigir e Validar a libc++ do Sistema (${{ matrix.component }}-${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21' || true
           clang++ --version
 
+          # (a) Patch nos headers do sistema
+          CFG=$(find /usr -path '*include/c++/v1/__config' 2>/dev/null | head -n 1)
+          test -n "$CFG" || { echo "ERRO: __config da libc++ não encontrado" >&2; exit 1; }
+          LIBCXX_INC=$(dirname "$CFG")
+          echo "libc++ headers em: $LIBCXX_INC"
+          for f in "$LIBCXX_INC/__bit_reference" "$LIBCXX_INC/__algorithm/sort.h"; do
+            if [ -f "$f" ] && ! grep -q '__bit/countr.h' "$f"; then
+              echo "Aplicando patch em $f"
+              sed -i '0,/#include <__config>/s//#include <__config>\n#include <__bit\/countr.h>\n#include <__bit\/countl.h>/' "$f"
+            fi
+          done
+
+          # (b) Header de force-include
           FIX_DIR=/usr/local/share/omnillvm-fix
           FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
           mkdir -p "$FIX_DIR"
@@ -643,28 +662,28 @@ jobs:
           EOF
 
           cat > /tmp/libcxx_probe.cpp << 'EOF'
+          #include <algorithm>
           #include <vector>
           #include <string>
           #include <charconv>
           #include <functional>
+          #include <bitset>
           int main() {
             std::vector<bool> v(10);
+            std::vector<int> a(1000);
+            std::sort(a.begin(), a.end());
+            std::nth_element(a.begin(), a.begin() + 10, a.end());
             char b[32];
             std::to_chars(b, b + 32, 12345);
             return v[0] ? 1 : 0;
           }
           EOF
 
-          if clang++ -std=c++17 -stdlib=libc++ -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe1.log; then
-            echo "✅ libc++ do sistema OK sem ajustes."
-            echo "LIBCXX_FIX_FLAG=" >> $GITHUB_ENV
-          elif clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe2.log; then
-            echo "⚠️ Aplicando workaround de force-include ($FIX_HDR)."
-            head -n 20 /tmp/probe1.log || true
+          if clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe2.log; then
+            echo "✅ libc++ do sistema OK (patch de headers + force-include $FIX_HDR)."
             echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
           else
-            echo "❌ libc++ do sistema inconsistente e workaround insuficiente." >&2
-            cat /tmp/probe1.log >&2 || true
+            echo "❌ libc++ do sistema inconsistente mesmo com patch e force-include." >&2
             cat /tmp/probe2.log >&2 || true
             exit 1
           fi
