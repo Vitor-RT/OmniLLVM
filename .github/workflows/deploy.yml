@@ -57,9 +57,9 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v22-swift-641-libcxx-bitfix-all
-  FRONTEND_CACHE_REV: v14-gnat-clang-cpp-libcxx-bitfix
-  PACKAGE_CACHE_REV: v14-audit-manifest
+  CORE_CACHE_REV: v23-swift-641-libcxx-shim
+  FRONTEND_CACHE_REV: v15-gnat-clang-cpp-libcxx-shim
+  PACKAGE_CACHE_REV: v15-audit-manifest
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -189,61 +189,25 @@ jobs:
           echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------------------
-      # Correção da libc++ do sistema (erro "__libcpp_ctz/__libcpp_clz" não declarado).
-      # Os headers do pacote libc++-dev usam __libcpp_ctz/clz em vários arquivos
-      # (sort.h, __bit_reference, __charconv/*) sem incluir __bit/countr.h / countl.h.
-      # Estratégia:
-      #   (1) descobrir o diretório de headers REALMENTE usado pelo clang (-H);
-      #   (2) conferir que __libcpp_ctz está definido em __bit/countr.h (senão: pacote quebrado);
-      #   (3) corrigir TODOS os arquivos que usam ctz/clz sem incluir o header certo;
-      #   (4) validar com uma sondagem SEM force-include (prova que o patch funciona);
-      #   (5) exportar o force-include como defesa adicional (LIBCXX_FIX_FLAG).
+      # Correção da libc++ do sistema.
+      # O pacote libc++ do Ubuntu 26.04 é inconsistente: __bit_reference, sort.h e __charconv/*
+      # chamam std::__libcpp_ctz/clz, mas essas funções só existem em __cxx03/__bit/*.
+      # Estratégia: gerar um header de force-include que (a) inclui __bit/countr.h e countl.h
+      # e (b) fornece um shim próprio (via __builtin_ctz/clz) SOMENTE para o que a sondagem
+      # mostrar que está ausente. Sem patch nos headers do sistema.
       # ----------------------------------------------------------------------
-      - name: 1B. Corrigir e Validar a libc++ do Sistema
+      - name: 1B. Corrigir e Validar a libc++ do Sistema (shim ctz/clz)
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           echo "--- pacotes relacionados:"
           dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21|clang ' || true
           clang++ --version
 
-          # (1) Diretório de headers usado de fato pelo clang
-          CFG=$(printf '#include <vector>\n' | clang++ -stdlib=libc++ -std=c++17 -x c++ -E -H - 2>&1 >/dev/null \
-                  | grep -m1 '/__config$' | sed 's/^[. ]*//')
-          test -n "$CFG" || { echo "ERRO: não foi possível localizar __config via clang -H" >&2; exit 1; }
-          LIBCXX_INC=$(dirname "$CFG")
-          echo "libc++ headers usados pelo clang: $LIBCXX_INC"
-
-          # (2) A definição precisa existir
-          echo "--- definições de __libcpp_ctz / __libcpp_clz:"
-          grep -rnE 'inline.*__libcpp_(ctz|clz)\(' "$LIBCXX_INC" | head -n 20 || true
-          grep -q '__libcpp_ctz' "$LIBCXX_INC/__bit/countr.h" \
-            || { echo "ERRO: __libcpp_ctz não é definido em __bit/countr.h; headers do pacote inconsistentes." >&2; exit 1; }
-          grep -q '__libcpp_clz' "$LIBCXX_INC/__bit/countl.h" \
-            || { echo "ERRO: __libcpp_clz não é definido em __bit/countl.h; headers do pacote inconsistentes." >&2; exit 1; }
-
-          # (3) Patch em TODOS os arquivos que usam ctz/clz sem incluir o header certo
-          patch_users() {
-            fn="$1"; hdr="$2"
-            for f in $(grep -rlE "${fn}\(" "$LIBCXX_INC" 2>/dev/null); do
-              case "$f" in
-                */__bit/countr.h|*/__bit/countl.h) continue ;;
-              esac
-              grep -q "__bit/${hdr}.h" "$f" && continue
-              sed -i "0,/^#[[:space:]]*include </s//#include <__bit\/${hdr}.h>\n&/" "$f"
-              if grep -q "__bit/${hdr}.h" "$f"; then
-                echo "patch ${hdr}: $f"
-              else
-                echo "AVISO: sem '#include <' para ancorar o patch em $f" >&2
-              fi
-            done
-          }
-          patch_users __libcpp_ctz countr
-          patch_users __libcpp_clz countl
-
-          # (5) Header de force-include (defesa adicional)
           FIX_DIR=/usr/local/share/omnillvm-fix
           FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
           mkdir -p "$FIX_DIR"
+
+          # Base: inclui os headers de contagem de bits quando existirem.
           cat > "$FIX_HDR" << 'EOF'
           #ifdef __cplusplus
           #if __has_include(<__bit/countr.h>)
@@ -255,7 +219,46 @@ jobs:
           #endif
           EOF
 
-          # (4) Sondagem
+          # Sonda se um símbolo está disponível após <vector>/<charconv>/<algorithm> com o force-include atual.
+          probe() {
+            printf '#include <vector>\n#include <charconv>\n#include <algorithm>\nint main(){ return (int)(%s); }\n' "$1" \
+              | clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -x c++ -fsyntax-only - >/dev/null 2>&1
+          }
+
+          if probe 'std::__libcpp_ctz(1u)'; then
+            echo "✅ std::__libcpp_ctz já disponível; sem shim."
+          else
+            echo "⚠️ std::__libcpp_ctz ausente; adicionando shim."
+            cat >> "$FIX_HDR" << 'EOF'
+          #ifdef __cplusplus
+          namespace std {
+          inline int __libcpp_ctz(unsigned x) { return __builtin_ctz(x); }
+          inline int __libcpp_ctz(unsigned long x) { return __builtin_ctzl(x); }
+          inline int __libcpp_ctz(unsigned long long x) { return __builtin_ctzll(x); }
+          }
+          #endif
+          EOF
+          fi
+
+          if probe 'std::__libcpp_clz(1u)'; then
+            echo "✅ std::__libcpp_clz já disponível; sem shim."
+          else
+            echo "⚠️ std::__libcpp_clz ausente; adicionando shim."
+            cat >> "$FIX_HDR" << 'EOF'
+          #ifdef __cplusplus
+          namespace std {
+          inline int __libcpp_clz(unsigned x) { return __builtin_clz(x); }
+          inline int __libcpp_clz(unsigned long x) { return __builtin_clzl(x); }
+          inline int __libcpp_clz(unsigned long long x) { return __builtin_clzll(x); }
+          }
+          #endif
+          EOF
+          fi
+
+          echo "--- conteúdo final do force-include:"
+          cat "$FIX_HDR"
+
+          # Sondagem final (mesma forma que o build usa: -std=c++17, libc++, force-include).
           cat > /tmp/libcxx_probe.cpp << 'EOF'
           #include <algorithm>
           #include <vector>
@@ -275,16 +278,11 @@ jobs:
             return v[0] ? 1 : 0;
           }
           EOF
-
-          if clang++ -std=c++17 -stdlib=libc++ -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe1.log; then
-            echo "✅ libc++ do sistema OK apenas com o patch de headers (sem force-include)."
-          elif clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe2.log; then
-            echo "⚠️ O patch sozinho não bastou; OK apenas com force-include. Erro sem force-include:"
-            head -n 30 /tmp/probe1.log || true
+          if clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe.log; then
+            echo "✅ libc++ do sistema OK com o force-include."
           else
-            echo "❌ libc++ do sistema inconsistente mesmo com patch e force-include." >&2
-            echo "--- sem force-include:" >&2; cat /tmp/probe1.log >&2 || true
-            echo "--- com force-include:" >&2; cat /tmp/probe2.log >&2 || true
+            echo "❌ libc++ do sistema ainda inconsistente mesmo com o shim." >&2
+            cat /tmp/probe.log >&2 || true
             exit 1
           fi
           echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
@@ -680,48 +678,16 @@ jobs:
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
           "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
 
-      - name: 1B. Corrigir e Validar a libc++ do Sistema (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 1B. Corrigir e Validar a libc++ do Sistema - shim ctz/clz (${{ matrix.component }}-${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21' || true
           clang++ --version
 
-          # (1) Diretório de headers usado de fato pelo clang
-          CFG=$(printf '#include <vector>\n' | clang++ -stdlib=libc++ -std=c++17 -x c++ -E -H - 2>&1 >/dev/null \
-                  | grep -m1 '/__config$' | sed 's/^[. ]*//')
-          test -n "$CFG" || { echo "ERRO: não foi possível localizar __config via clang -H" >&2; exit 1; }
-          LIBCXX_INC=$(dirname "$CFG")
-          echo "libc++ headers usados pelo clang: $LIBCXX_INC"
-
-          # (2) A definição precisa existir
-          grep -q '__libcpp_ctz' "$LIBCXX_INC/__bit/countr.h" \
-            || { echo "ERRO: __libcpp_ctz não é definido em __bit/countr.h; headers do pacote inconsistentes." >&2; exit 1; }
-          grep -q '__libcpp_clz' "$LIBCXX_INC/__bit/countl.h" \
-            || { echo "ERRO: __libcpp_clz não é definido em __bit/countl.h; headers do pacote inconsistentes." >&2; exit 1; }
-
-          # (3) Patch em TODOS os arquivos que usam ctz/clz sem incluir o header certo
-          patch_users() {
-            fn="$1"; hdr="$2"
-            for f in $(grep -rlE "${fn}\(" "$LIBCXX_INC" 2>/dev/null); do
-              case "$f" in
-                */__bit/countr.h|*/__bit/countl.h) continue ;;
-              esac
-              grep -q "__bit/${hdr}.h" "$f" && continue
-              sed -i "0,/^#[[:space:]]*include </s//#include <__bit\/${hdr}.h>\n&/" "$f"
-              if grep -q "__bit/${hdr}.h" "$f"; then
-                echo "patch ${hdr}: $f"
-              else
-                echo "AVISO: sem '#include <' para ancorar o patch em $f" >&2
-              fi
-            done
-          }
-          patch_users __libcpp_ctz countr
-          patch_users __libcpp_clz countl
-
-          # (5) Header de force-include (defesa adicional)
           FIX_DIR=/usr/local/share/omnillvm-fix
           FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
           mkdir -p "$FIX_DIR"
+
           cat > "$FIX_HDR" << 'EOF'
           #ifdef __cplusplus
           #if __has_include(<__bit/countr.h>)
@@ -733,7 +699,43 @@ jobs:
           #endif
           EOF
 
-          # (4) Sondagem
+          probe() {
+            printf '#include <vector>\n#include <charconv>\n#include <algorithm>\nint main(){ return (int)(%s); }\n' "$1" \
+              | clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -x c++ -fsyntax-only - >/dev/null 2>&1
+          }
+
+          if probe 'std::__libcpp_ctz(1u)'; then
+            echo "✅ std::__libcpp_ctz já disponível; sem shim."
+          else
+            echo "⚠️ std::__libcpp_ctz ausente; adicionando shim."
+            cat >> "$FIX_HDR" << 'EOF'
+          #ifdef __cplusplus
+          namespace std {
+          inline int __libcpp_ctz(unsigned x) { return __builtin_ctz(x); }
+          inline int __libcpp_ctz(unsigned long x) { return __builtin_ctzl(x); }
+          inline int __libcpp_ctz(unsigned long long x) { return __builtin_ctzll(x); }
+          }
+          #endif
+          EOF
+          fi
+
+          if probe 'std::__libcpp_clz(1u)'; then
+            echo "✅ std::__libcpp_clz já disponível; sem shim."
+          else
+            echo "⚠️ std::__libcpp_clz ausente; adicionando shim."
+            cat >> "$FIX_HDR" << 'EOF'
+          #ifdef __cplusplus
+          namespace std {
+          inline int __libcpp_clz(unsigned x) { return __builtin_clz(x); }
+          inline int __libcpp_clz(unsigned long x) { return __builtin_clzl(x); }
+          inline int __libcpp_clz(unsigned long long x) { return __builtin_clzll(x); }
+          }
+          #endif
+          EOF
+          fi
+
+          cat "$FIX_HDR"
+
           cat > /tmp/libcxx_probe.cpp << 'EOF'
           #include <algorithm>
           #include <vector>
@@ -753,16 +755,11 @@ jobs:
             return v[0] ? 1 : 0;
           }
           EOF
-
-          if clang++ -std=c++17 -stdlib=libc++ -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe1.log; then
-            echo "✅ libc++ do sistema OK apenas com o patch de headers (sem force-include)."
-          elif clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe2.log; then
-            echo "⚠️ O patch sozinho não bastou; OK apenas com force-include. Erro sem force-include:"
-            head -n 30 /tmp/probe1.log || true
+          if clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe.log; then
+            echo "✅ libc++ do sistema OK com o force-include."
           else
-            echo "❌ libc++ do sistema inconsistente mesmo com patch e force-include." >&2
-            echo "--- sem force-include:" >&2; cat /tmp/probe1.log >&2 || true
-            echo "--- com force-include:" >&2; cat /tmp/probe2.log >&2 || true
+            echo "❌ libc++ do sistema ainda inconsistente mesmo com o shim." >&2
+            cat /tmp/probe.log >&2 || true
             exit 1
           fi
           echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
