@@ -38,6 +38,12 @@ on:
 permissions:
   contents: write
 
+# Shell fixo: evita cair em dash/sh (onde 'compgen' e outros recursos do bash não existem).
+# Sem pipefail de propósito: vários pipes do workflow (ldd | grep -q, find | head) dependem disso.
+defaults:
+  run:
+    shell: bash -e {0}
+
 env:
   INSTALL_PREFIX: /opt/omnillvm
   # ==========================================================================
@@ -51,7 +57,7 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v19-swift-641-libcxx-llvm-unwindfix
+  CORE_CACHE_REV: v20-swift-641-libcxx-probe
   FRONTEND_CACHE_REV: v13-gnat-clang-cpp-libcxx-unwindfix
   PACKAGE_CACHE_REV: v13-audit-manifest
   DEBIAN_FRONTEND: noninteractive
@@ -95,10 +101,11 @@ jobs:
             swift_dir_arch: "-aarch64"
 
     steps:
-      - name: 0A. Preparar ZSTD para o Cache do GitHub no Ubuntu 26.04
+      - name: 0A. Preparar ZSTD e BASH para o Cache do GitHub no Ubuntu 26.04
+        shell: sh -e {0}
         run: |
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends zstd ca-certificates tar
+          apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -126,7 +133,6 @@ jobs:
 
           # FIX: binários do build linkados com libc++ (host) precisam de libunwind.so.1 (LLVM)
           # em runtime, pois o ninja executa ferramentas recém-compiladas (ex.: swift-compatibility-symbols).
-          # No Ubuntu esse arquivo fica em /usr/lib/llvm-*/lib, fora do caminho padrão do loader.
           apt-get install -y -qq --no-install-recommends libunwind-21-dev \
             || apt-get install -y -qq --no-install-recommends libunwind-20-dev \
             || true
@@ -165,7 +171,6 @@ jobs:
           ln -sf /usr/bin/mold /opt/swift-bootstrap/bin/ld.mold
 
           # Verifica antecipadamente o bootstrap Swift usando o linker LLVM.
-          # Usamos o Swift 6.4.1 nativo para Ubuntu 26.04 e forçamos LLVM LLD.
           printf 'print("Swift bootstrap LLD OK")\n' > /tmp/omnillvm-swift-bootstrap-test.swift
           /opt/swift-bootstrap/bin/swiftc -use-ld=lld \
             /tmp/omnillvm-swift-bootstrap-test.swift \
@@ -182,6 +187,71 @@ jobs:
           echo "cores=$CORES" >> $GITHUB_OUTPUT
           echo "compile_jobs=$COMPILE_JOBS" >> $GITHUB_OUTPUT
           echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------------------------------
+      # Diagnóstico + sondagem da libc++ do sistema.
+      # O build do LLVM falhou com "no member named '__libcpp_ctz/__libcpp_clz' in namespace 'std'"
+      # ao incluir <vector>/<charconv> da libc++ do Ubuntu. Aqui:
+      #   1) listamos pacotes/headers (para o log mostrar a causa real);
+      #   2) compilamos um teste com -stdlib=libc++;
+      #   3) se falhar, tentamos um header de force-include (countr/countl);
+      #   4) se ainda falhar, abortamos cedo com o log completo.
+      # O flag escolhido vai para LIBCXX_FIX_FLAG (vazio quando não precisa).
+      # ----------------------------------------------------------------------
+      - name: 1B. Diagnóstico e Sondagem da libc++ do Sistema
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "--- pacotes relacionados:"
+          dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21|clang ' || true
+          clang++ --version
+          echo "--- diretórios c++/v1 encontrados:"
+          find /usr -type d -path '*include/c++/v1' 2>/dev/null || true
+          echo "--- onde __libcpp_ctz/__libcpp_clz são definidos:"
+          grep -rln "__libcpp_ctz\|__libcpp_clz" /usr/lib/llvm-21/include/c++/v1 2>/dev/null | head -n 20 || true
+          echo "--- includes do __bit_reference:"
+          grep -n "#\s*include" /usr/lib/llvm-21/include/c++/v1/__bit_reference 2>/dev/null | head -n 40 || true
+
+          FIX_DIR=/usr/local/share/omnillvm-fix
+          FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
+          mkdir -p "$FIX_DIR"
+          cat > "$FIX_HDR" << 'EOF'
+          #ifdef __cplusplus
+          #if __has_include(<__bit/countr.h>)
+          #include <__bit/countr.h>
+          #endif
+          #if __has_include(<__bit/countl.h>)
+          #include <__bit/countl.h>
+          #endif
+          #endif
+          EOF
+
+          cat > /tmp/libcxx_probe.cpp << 'EOF'
+          #include <vector>
+          #include <string>
+          #include <charconv>
+          #include <functional>
+          int main() {
+            std::vector<bool> v(10);
+            char b[32];
+            std::to_chars(b, b + 32, 12345);
+            return v[0] ? 1 : 0;
+          }
+          EOF
+
+          if clang++ -std=c++17 -stdlib=libc++ -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe1.log; then
+            echo "✅ libc++ do sistema OK sem ajustes."
+            echo "LIBCXX_FIX_FLAG=" >> $GITHUB_ENV
+          elif clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe2.log; then
+            echo "⚠️ libc++ do sistema só compila com o force-include ($FIX_HDR). Aplicando workaround."
+            echo "--- erro original:"; head -n 20 /tmp/probe1.log || true
+            echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
+          else
+            echo "❌ libc++ do sistema está inconsistente e o workaround não resolveu." >&2
+            echo "--- erro sem workaround:" >&2; cat /tmp/probe1.log >&2 || true
+            echo "--- erro com workaround:" >&2; cat /tmp/probe2.log >&2 || true
+            echo "Sugestão: fixar versões (libc++-21-dev libc++abi-21-dev) ou compilar o host com libstdc++ só no bootstrap." >&2
+            exit 1
+          fi
 
       - name: 2. Cache ccache (Ubuntu 26.04 - ${{ matrix.arch }})
         if: steps.core-cache.outputs.cache-hit != 'true'
@@ -232,7 +302,6 @@ jobs:
             ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
           fi
           # A stdlib do Swift 6.4.1 usa SwiftMacros; isso exige swift-syntax.
-          # A biblioteca e integrada por CMake, sem executar Swift Package Manager.
           if [ ! -f "$GITHUB_WORKSPACE/src/swift-syntax/CMakeLists.txt" ]; then
             rm -rf "$GITHUB_WORKSPACE/src/swift-syntax"
             git clone --depth 1 --single-branch --branch "${{ env.SWIFT_SCHEME }}" \
@@ -245,7 +314,6 @@ jobs:
           echo "swift-syntax pronto: $(git -C "$GITHUB_WORKSPACE/src/swift-syntax" rev-parse --short HEAD)"
 
           # Remover apenas gerenciadores de pacotes e driver externo.
-          # O build-script é instruído a NÃO executar earlyswiftdriver.
           rm -rf "$GITHUB_WORKSPACE/src/swiftpm" "$GITHUB_WORKSPACE/src/swift-driver"
 
       - name: 4. Compilar e Configurar Core 6.4.1 Completo na Origem (LLVM + Clang + Swiftc + LLDB + Runtimes)
@@ -257,8 +325,10 @@ jobs:
           export CC=/usr/bin/clang
           export CXX=/usr/bin/clang++
           export CFLAGS="${{ env.MAX_OPT_FLAGS }}"
-          export CXXFLAGS="${{ env.MAX_OPT_FLAGS }} -stdlib=libc++"
+          # LIBCXX_FIX_FLAG vem do passo 1B (vazio ou "-include <header>").
+          export CXXFLAGS="${{ env.MAX_OPT_FLAGS }} -stdlib=libc++ ${LIBCXX_FIX_FLAG:-}"
           export TMPDIR="/tmp"
+          echo "LIBCXX_FIX_FLAG='${LIBCXX_FIX_FLAG:-}'"
 
           # FIX: garante que ferramentas executadas durante o build achem libunwind.so.1 do LLVM
           UNW_DIR=$(dirname "$(find /usr/lib -name 'libunwind.so.1*' 2>/dev/null | head -n 1)")
@@ -266,6 +336,7 @@ jobs:
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN/../lib/swift/linux:\$ORIGIN"
+          CXX_REL_FLAGS="${{ env.MAX_OPT_FLAGS }} -stdlib=libc++ ${LIBCXX_FIX_FLAG:-}"
 
           # 1. Ativa LinkDyLib = true nativamente no código-fonte C++ do llvm-config
           sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
@@ -276,12 +347,7 @@ jobs:
             xargs grep -l "version-script" 2>/dev/null | \
             xargs sed -i 's/-Wl,--version-script/-Wl,--undefined-version,--version-script/g' 2>/dev/null || true
 
-          # O driver externo continua desabilitado, mas o suporte a SwiftSyntax
-          # precisa ficar ATIVO: SwiftMacros é dependência da biblioteca padrão.
-          # O build-script configura SWIFT_BUILD_SWIFT_SYNTAX=ON automaticamente
-          # quando --skip-early-swiftsyntax NÃO é informado.
-          # Backtracing precisa ficar ATIVO: o runtime exporta o símbolo
-          # _swift_backtrace_isThunkFunction usado por lib_CompilerSwiftSyntax.so.
+          # Backtracing e SwiftSyntax precisam ficar ATIVOS (ver comentários originais).
           ./swift/utils/build-script \
             --release \
             --skip-early-swift-driver \
@@ -301,7 +367,7 @@ jobs:
               -DCMAKE_C_COMPILER_LAUNCHER=ccache \
               -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
               -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
-              -DCMAKE_CXX_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }} -stdlib=libc++' \
+              -DCMAKE_CXX_FLAGS_RELEASE='${CXX_REL_FLAGS}' \
               -DCMAKE_INSTALL_RPATH='${BUILD_RPATH}' \
               -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
               -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
@@ -346,8 +412,6 @@ jobs:
 
           LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
           SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
-          # O driver deve inicializar com todas as bibliotecas runtime carregadas,
-          # inclusive lib_CompilerSwiftSyntax.so, sem símbolos indefinidos.
           test -n "$SWIFT_BUILD_DIR" && test -x "$SWIFT_BUILD_DIR/bin/swiftc"
           "$SWIFT_BUILD_DIR/bin/swiftc" --version
           LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
@@ -391,8 +455,8 @@ jobs:
           cp -af "$LLVM_BUILD_DIR/lib/libLLVM"*".so"* "$TOOLCHAIN/lib/"
           cp -af "$LLVM_BUILD_DIR/lib/libclang"*".so"* "$TOOLCHAIN/lib/" || true
           # GNAT-LLVM usa a API C++ interna do Clang, distribuída em libclang-cpp.so.
-          # Não confundir com a API C libclang.so.
-          if ! compgen -G "$TOOLCHAIN/lib/libclang-cpp.so*" >/dev/null; then
+          # (POSIX: sem 'compgen', que não existe em dash/sh.)
+          if [ -z "$(find "$TOOLCHAIN/lib" -maxdepth 1 -name 'libclang-cpp.so*' | head -n 1)" ]; then
             echo "ERRO: libclang-cpp.so não foi gerada pelo Core LLVM/Clang." >&2
             exit 1
           fi
@@ -484,7 +548,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
-      # /tmp precisa permitir execucao: o Swift/CMake cria e executa binarios de teste ali.
       options: --privileged -v /opt:/opt --shm-size=8g --tmpfs /tmp:rw,exec,nosuid,size=6g,mode=1777
     timeout-minutes: 180
     strategy:
@@ -503,10 +566,11 @@ jobs:
             gnu_triple: aarch64-linux-gnu
 
     steps:
-      - name: 0A. Preparar ZSTD para o Cache do GitHub no Ubuntu 26.04
+      - name: 0A. Preparar ZSTD e BASH para o Cache do GitHub no Ubuntu 26.04
+        shell: sh -e {0}
         run: |
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends zstd ca-certificates tar
+          apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -531,10 +595,9 @@ jobs:
         id: hw
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends curl git xz-utils procps
+          apt-get install -y -qq --no-install-recommends curl git xz-utils procps clang lld libc++-dev libc++abi-dev
 
           # FIX: libunwind.so.1 do LLVM visível para binários linkados com libc++ executados durante o build
-          apt-get install -y -qq --no-install-recommends libc++-dev libc++abi-dev || true
           apt-get install -y -qq --no-install-recommends libunwind-21-dev \
             || apt-get install -y -qq --no-install-recommends libunwind-20-dev \
             || true
@@ -559,6 +622,53 @@ jobs:
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
           "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
 
+      - name: 1B. Sondagem da libc++ do Sistema (${{ matrix.component }}-${{ matrix.arch }})
+        if: steps.overlay-cache.outputs.cache-hit != 'true'
+        run: |
+          dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21' || true
+          clang++ --version
+
+          FIX_DIR=/usr/local/share/omnillvm-fix
+          FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
+          mkdir -p "$FIX_DIR"
+          cat > "$FIX_HDR" << 'EOF'
+          #ifdef __cplusplus
+          #if __has_include(<__bit/countr.h>)
+          #include <__bit/countr.h>
+          #endif
+          #if __has_include(<__bit/countl.h>)
+          #include <__bit/countl.h>
+          #endif
+          #endif
+          EOF
+
+          cat > /tmp/libcxx_probe.cpp << 'EOF'
+          #include <vector>
+          #include <string>
+          #include <charconv>
+          #include <functional>
+          int main() {
+            std::vector<bool> v(10);
+            char b[32];
+            std::to_chars(b, b + 32, 12345);
+            return v[0] ? 1 : 0;
+          }
+          EOF
+
+          if clang++ -std=c++17 -stdlib=libc++ -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe1.log; then
+            echo "✅ libc++ do sistema OK sem ajustes."
+            echo "LIBCXX_FIX_FLAG=" >> $GITHUB_ENV
+          elif clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe2.log; then
+            echo "⚠️ Aplicando workaround de force-include ($FIX_HDR)."
+            head -n 20 /tmp/probe1.log || true
+            echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
+          else
+            echo "❌ libc++ do sistema inconsistente e workaround insuficiente." >&2
+            cat /tmp/probe1.log >&2 || true
+            cat /tmp/probe2.log >&2 || true
+            exit 1
+          fi
+
       - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
@@ -576,6 +686,7 @@ jobs:
           apt-get install -y -qq --no-install-recommends cmake ninja-build make clang lld mold ccache python3 zlib1g-dev patchelf libc++-dev libc++abi-dev
 
           export TMPDIR="/tmp"
+          CXX_REL_FLAGS="${{ env.MAX_OPT_FLAGS }} ${LIBCXX_FIX_FLAG:-}"
 
           mkdir -p $GITHUB_WORKSPACE/flang-src && cd $GITHUB_WORKSPACE/flang-src
           git clone --filter=blob:none --no-checkout --depth 1 --branch ${{ env.SWIFT_LLVM_BRANCH }} https://github.com/swiftlang/llvm-project.git
@@ -588,11 +699,11 @@ jobs:
           find flang flang-rt -name "CMakeLists.txt" -o -name "*.cmake" 2>/dev/null | \
             xargs sed -i 's/check_library_exists(quadmath.*/set(HAVE_LIBQUADMATH OFF)/g; s/check_include_file(quadmath.h.*/set(HAVE_QUADMATH_H OFF)/g' 2>/dev/null || true
 
-          # 2. Compila Flang + MLIR + flang-rt (CENÁRIO A: Habilita libflang_rt.runtime.a para programas 100% Fortran standalone!)
+          # 2. Compila Flang + MLIR + flang-rt
           cmake -G Ninja -S llvm -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${{ env.MAX_OPT_FLAGS }}" \
-            -DCMAKE_CXX_FLAGS_RELEASE="${{ env.MAX_OPT_FLAGS }}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${CXX_REL_FLAGS}" \
             -DCMAKE_INSTALL_PREFIX="/opt/overlay-install" \
             -DCMAKE_INSTALL_RPATH="\$ORIGIN/../lib:\$ORIGIN" \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
@@ -666,7 +777,6 @@ jobs:
         if: matrix.component == 'gnat-ada' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           # Apenas o compilador Ada do GNAT 15 serve de bootstrap (NÃO é empacotado).
-          # C/C++, LLD e runtimes C++ usam LLVM; não instalar g++/build-essential.
           apt-get install -y -qq --no-install-recommends make gprbuild cmake ninja-build \
             clang lld ccache python3 zlib1g-dev patchelf libc++-dev libc++abi-dev
           apt-get install -y -qq --no-install-recommends gnat-15 gcc-15
@@ -674,7 +784,6 @@ jobs:
           GNAT_VER=15
           test -x /usr/bin/gcc-15 || { echo "GNAT 15 bootstrap indisponível" >&2; exit 1; }
           # O Makefile do AdaCore usa `gcc -dumpmachine` para identificar o alvo.
-          # Esse alias só existe NO CONTÊINER DE COMPILAÇÃO.
           ln -sf /usr/bin/gcc-15 /usr/bin/gcc
           ln -sf /usr/bin/gnat-${GNAT_VER} /usr/bin/gnat
           ln -sf /usr/bin/gnatmake-${GNAT_VER} /usr/bin/gnatmake
@@ -735,7 +844,6 @@ jobs:
           sed -i 's/"-Werror"/"-Wno-error"/g' llvm-interface/*.gpr 2>/dev/null || true
           sed -i 's/"-gnatg"/"-gnatg", "-gnatwn"/g' llvm-interface/*.gpr 2>/dev/null || true
           # GNAT-LLVM 27.1 exige -lclangBasic (estática) e fixa os runtimes GCC.
-          # O Core distribui libclang-cpp.so e libc++/libunwind do próprio LLVM.
           # Corrigir as DUAS GPRs: a de llvm-gnat1 e a dos auxiliares Ada.
           python3 - <<'PY_GPR'
           from pathlib import Path
@@ -755,15 +863,13 @@ jobs:
           PY_GPR
 
           # Clang/LLVM C++ precisam usar a MESMA ABI (libc++) nos dois estágios.
-          # O Makefile original mistura stdlibc++ e libc++ se não receber CXXFLAGS.
           make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            CXXFLAGS="-stdlib=libc++ -Wno-error" \
+            CXXFLAGS="-stdlib=libc++ -Wno-error ${LIBCXX_FIX_FLAG:-}" \
             LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
             PREFIX="/opt/overlay-install" \
             build
 
           test -x llvm-interface/bin/llvm-gnat1
-          # Diagnóstico antecipado de ELF e bibliotecas C++ exigidas pelo Ada.
           ldd llvm-interface/bin/llvm-gnat1 || true
 
           # CONFIGURAÇÃO PERMANENTE E COMPLETA DA RTS DO ADA NO STAGE 2:
@@ -772,8 +878,6 @@ jobs:
           ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
           ADA_INC_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adainclude/system.ads))
           cp -af "$ADA_LIB_DIR/"*.ali /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
-          # Não falsificar a versão da RTS. Os arquivos .ali são do GNAT 15 e
-          # devem conservar a identificação real do compilador que os gerou.
           cp -af "$ADA_INC_DIR/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
 
           ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat.so
@@ -812,7 +916,6 @@ jobs:
           fi
 
           # extended = false e tools = [] garante que APENAS o compilador rustc e a libstd sejam compilados
-          # (Zero compilação do Cargo ou qualquer gerenciador de pacotes externo!)
           cat <<EOF > bootstrap.toml
           change-id = "ignore"
 
@@ -903,10 +1006,11 @@ jobs:
             gnu_triple: aarch64-linux-gnu
 
     steps:
-      - name: 0A. Preparar ZSTD para o Cache do GitHub no Ubuntu 26.04
+      - name: 0A. Preparar ZSTD e BASH para o Cache do GitHub no Ubuntu 26.04
+        shell: sh -e {0}
         run: |
           apt-get update -qq
-          apt-get install -y -qq --no-install-recommends zstd ca-certificates tar
+          apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -961,12 +1065,9 @@ jobs:
             ln -sf "$CRT_DIR"/clang_rt.crtendS*.o "$TOOLCHAIN/lib/crtendS.o" 2>/dev/null || true
             BUILTINS_A=$(find "$CRT_DIR" -name "libclang_rt.builtins*.a" | head -n 1)
             if [ -n "$BUILTINS_A" ]; then
-              # Builtins LLVM nativos: não os renomear para falsos arquivos GCC.
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libclang_rt.builtins.a"
             fi
           fi
-          # libunwind.so já fornece o unwinder LLVM; não gerar libgcc_s.so
-          # ou libunwind.a fictícios por redirecionamento.
 
           cat << 'EOF' > "$TOOLCHAIN/bin/clang.cfg"
           --rtlib=compiler-rt
@@ -994,7 +1095,7 @@ jobs:
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
 
-          # 3. Gera o script oficial install-ubuntu26.04-deps.sh dentro da toolchain (Enxuto — Sem curl/ssl de gerenciadores de pacotes!)
+          # 3. Gera o script oficial install-ubuntu26.04-deps.sh dentro da toolchain
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
           set -euo pipefail
@@ -1014,8 +1115,6 @@ jobs:
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
 
-          # Não alterar /usr/lib e não instalar substitutos falsos de libgcc.
-          # O clang.cfg usa compiler-rt + libunwind + libc++ sob /opt/omnillvm.
           echo "✅ Todas as bibliotecas dinâmicas de sistema do Ubuntu 26.04 foram instaladas com sucesso!"
           EOF
           chmod +x "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
@@ -1044,7 +1143,6 @@ jobs:
           fi
 
           # Auditoria estrutural: nenhum executável nem runtime de GCC/G++ no tarball.
-          # GNAT LLVM conserva links para a RTS Ada do sistema quando necessária.
           if find "$TOOLCHAIN/bin" -maxdepth 1 \
             \( -name 'gcc' -o -name 'gcc-*' -o -name 'g++' -o -name 'g++-*' \
                -o -name 'cc1' -o -name 'cc1plus' -o -name 'gnat1' \) | grep -q .; then
@@ -1065,10 +1163,7 @@ jobs:
             -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
           \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
 
-      # ----------------------------------------------------------------------
-      # NOVO: Manifesto de arquivos + verificação de componentes essenciais.
-      # Roda ANTES de purgar/testar, para falhar cedo se algo foi mascarado por '|| true'.
-      # ----------------------------------------------------------------------
+      # Manifesto de arquivos + verificação de componentes essenciais.
       - name: "📋 1B. Manifesto de Arquivos + Verificação de Componentes Essenciais (${{ matrix.arch }})"
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
@@ -1091,7 +1186,6 @@ jobs:
             echo "| $TOTAL | $FILES | $LINKS | $DIRS |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Contagem por diretório de topo (ajuda a localizar onde as arquiteturas divergem)
           for d in bin lib include share libexec; do
             if [ -d "$d" ]; then
               echo "  $d: $(find "$d" | wc -l) entradas"
@@ -1101,7 +1195,7 @@ jobs:
           # Componentes essenciais: precisam existir em AMBAS as arquiteturas.
           MISSING=0
           check() {
-            local label="$1"; shift
+            label="$1"; shift
             if [ -z "$(find "$TOOLCHAIN" "$@" 2>/dev/null | head -n 1)" ]; then
               echo "❌ AUSENTE: $label"
               MISSING=1
@@ -1349,7 +1443,7 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # NOVO: Compara os manifestos amd64 x arm64 (informativo — não bloqueia a release)
+  # Compara os manifestos amd64 x arm64 (informativo — não bloqueia a release)
   # ============================================================================
   compare-manifests:
     name: "Compare: amd64 vs arm64 (arquivos normalizados)"
@@ -1445,7 +1539,6 @@ jobs:
             fi
           fi
 
-          # Gera o script standalone install-ubuntu26.04-deps.sh (Enxuto — Sem libs de gerenciadores de pacotes)
           cat << 'EOF' > install-ubuntu26.04-deps.sh
           #!/usr/bin/env bash
           set -euo pipefail
@@ -1465,8 +1558,6 @@ jobs:
             libblocksruntime0 libblocksruntime-dev \
             libgnat-15
 
-          # Não alterar /usr/lib e não instalar substitutos falsos de libgcc.
-          # O clang.cfg usa compiler-rt + libunwind + libc++ sob /opt/omnillvm.
           echo "✅ Dependências de sistema instaladas! Extraia o pacote em /opt/omnillvm e adicione /opt/omnillvm/bin ao PATH."
           EOF
           chmod +x install-ubuntu26.04-deps.sh
