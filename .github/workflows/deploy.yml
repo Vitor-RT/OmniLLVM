@@ -57,8 +57,8 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v24-swift-641-libcxx-shim-perfn
-  FRONTEND_CACHE_REV: v16-gnat-clang-cpp-libcxx-shim-perfn
+  CORE_CACHE_REV: v25-swift-641-libcxx-no-clz-ambiguity
+  FRONTEND_CACHE_REV: v17-gnat-clang-cpp-libcxx-no-clz-ambiguity
   PACKAGE_CACHE_REV: v16-audit-manifest
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
@@ -189,15 +189,14 @@ jobs:
           echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------------------------------
-      # Correção da libc++ do sistema.
-      # O pacote libc++ do Ubuntu 26.04 é inconsistente: alguns headers chamam
-      # std::__libcpp_ctz/clz sem que a definição exista (ou esteja incluída).
-      # Estratégia: header de force-include que (a) inclui __bit/countr.h e countl.h e
-      # (b) acrescenta shim SOMENTE para cada overload (ctz/clz x unsigned/long/long long)
-      # que a sondagem isolada mostrar ausente. Nada de sondar via <vector>, que mascara
-      # a causa e gerava shims duplicados (erro "call to __libcpp_clz is ambiguous").
+      # Correção da libc++ do sistema (Ubuntu 26.04) sem ambiguidade:
+      # 1. Não ativa o shim quando _LIBCPP_BUILDING_LIBRARY está definido (build da libc++ nova).
+      # 2. Sonda <__bit/countr.h> (ctz) e <__bit/countl.h> (clz) de forma INDEPENDENTE
+      #    (para que um erro em countr.h não faça a sondagem de countl.h falhar e duplicar __libcpp_clz).
+      # 3. Declara qualquer shim dentro de _LIBCPP_BEGIN_NAMESPACE_STD / _LIBCPP_END_NAMESPACE_STD
+      #    (inline namespace __1) e ANTES de incluir <__bit/countr.h>/<__bit/countl.h>.
       # ----------------------------------------------------------------------
-      - name: 1B. Corrigir e Validar a libc++ do Sistema (shim ctz/clz por overload)
+      - name: 1B. Corrigir e Validar a libc++ do Sistema (shim ctz/clz sem ambiguidade)
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           echo "--- pacotes relacionados:"
@@ -208,9 +207,48 @@ jobs:
           FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
           mkdir -p "$FIX_DIR"
 
-          # Base: apenas inclui os headers de contagem de bits (sem shim ainda).
+          # Sonda cada família (ctz em countr.h, clz em countl.h) isoladamente!
+          probe_one() {
+            local hdr="$1"
+            local expr="$2"
+            printf '#include <__config>\n#if __has_include(<%s>)\n#include <%s>\n#endif\nint main(){ return (int)(%s); }\n' "$hdr" "$hdr" "$expr" \
+              | clang++ -std=c++17 -stdlib=libc++ -x c++ -fsyntax-only - >/dev/null 2>&1
+          }
+
+          SHIM_BODY=""
+          for pair in "ctz:__bit/countr.h" "clz:__bit/countl.h"; do
+            IFS=: read -r fn hdr <<< "$pair"
+            for spec in "unsigned:1u:" "unsigned long:1ul:l" "unsigned long long:1ull:ll"; do
+              IFS=: read -r ty lit suf <<< "$spec"
+              if probe_one "$hdr" "std::__libcpp_${fn}(${lit})"; then
+                echo "✅ std::__libcpp_${fn}(${ty}) já existe em <${hdr}>; sem shim."
+              else
+                echo "⚠️ std::__libcpp_${fn}(${ty}) ausente em <${hdr}>; adicionando shim em _LIBCPP_BEGIN_NAMESPACE_STD."
+                SHIM_BODY="${SHIM_BODY}[[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_${fn}(${ty} __x) _NOEXCEPT { return __builtin_${fn}${suf}(__x); }"$'\n'
+              fi
+            done
+          done
+
           cat > "$FIX_HDR" << 'EOF'
-          #ifdef __cplusplus
+          #ifndef OMNILLVM_LIBCXX_BITFIX_H
+          #define OMNILLVM_LIBCXX_BITFIX_H
+          #if defined(__cplusplus) && !defined(_LIBCPP_BUILDING_LIBRARY)
+          #if __has_include(<__config>)
+          #include <__config>
+          #endif
+          EOF
+
+          if [ -n "$SHIM_BODY" ]; then
+            {
+              echo '#ifdef _LIBCPP_BEGIN_NAMESPACE_STD'
+              echo '_LIBCPP_BEGIN_NAMESPACE_STD'
+              printf '%s' "$SHIM_BODY"
+              echo '_LIBCPP_END_NAMESPACE_STD'
+              echo '#endif'
+            } >> "$FIX_HDR"
+          fi
+
+          cat >> "$FIX_HDR" << 'EOF'
           #if __has_include(<__bit/countr.h>)
           #include <__bit/countr.h>
           #endif
@@ -218,41 +256,13 @@ jobs:
           #include <__bit/countl.h>
           #endif
           #endif
+          #endif
           EOF
 
-          # Sonda uma expressão usando SOMENTE o header base (sem <vector>).
-          probe() {
-            printf 'int main(){ return (int)(%s); }\n' "$1" \
-              | clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -x c++ -fsyntax-only - >/dev/null 2>&1
-          }
-
-          SHIM_BODY=""
-          for fn in ctz clz; do
-            for spec in "unsigned:1u:" "unsigned long:1ul:l" "unsigned long long:1ull:ll"; do
-              IFS=: read -r ty lit suf <<< "$spec"
-              if probe "std::__libcpp_${fn}(${lit})"; then
-                echo "✅ std::__libcpp_${fn}(${ty}) já existe; sem shim."
-              else
-                echo "⚠️ std::__libcpp_${fn}(${ty}) ausente; adicionando shim."
-                SHIM_BODY="${SHIM_BODY}inline int __libcpp_${fn}(${ty} x) { return __builtin_${fn}${suf}(x); }"$'\n'
-              fi
-            done
-          done
-
-          if [ -n "$SHIM_BODY" ]; then
-            {
-              echo '#ifdef __cplusplus'
-              echo 'namespace std {'
-              printf '%s' "$SHIM_BODY"
-              echo '}'
-              echo '#endif'
-            } >> "$FIX_HDR"
-          fi
-
           echo "--- conteúdo final do force-include:"
-          cat "$FIX_HDR"
+          cat -n "$FIX_HDR"
 
-          # Sondagem final (mesma forma que o build usa: -std=c++17, libc++, force-include).
+          # Sondagem final (testa <charconv>, <locale>, <format>, <vector>, <random>, etc. em C++17 e C++23).
           cat > /tmp/libcxx_probe.cpp << 'EOF'
           #include <algorithm>
           #include <vector>
@@ -261,34 +271,43 @@ jobs:
           #include <functional>
           #include <bitset>
           #include <locale>
+          #include <random>
+          #include <chrono>
           int main() {
             std::vector<bool> v(10);
             std::vector<int> a(1000);
             std::sort(a.begin(), a.end());
             std::nth_element(a.begin(), a.begin() + 10, a.end());
             char b[32];
-            std::to_chars(b, b + 32, 12345);
-            std::to_chars(b, b + 32, 12345, 16);
-            return v[0] ? 1 : 0;
+            std::to_chars(b, b + 32, 12345u);
+            std::to_chars(b, b + 32, 12345u, 2);
+            std::to_chars(b, b + 32, 12345u, 8);
+            std::to_chars(b, b + 32, 12345u, 16);
+            std::to_chars(b, b + 32, 12345ul, 16);
+            int out = 0;
+            std::from_chars(b, b + 4, out);
+            return v[0] ? 1 : out;
           }
           EOF
-          if clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe.log; then
-            echo "✅ libc++ do sistema OK com o force-include."
-          else
-            echo "❌ libc++ do sistema ainda inconsistente mesmo com o shim." >&2
-            cat /tmp/probe.log >&2 || true
-            exit 1
-          fi
+          for std_flag in -std=c++17 -std=c++23; do
+            if clang++ $std_flag -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe.log; then
+              echo "✅ libc++ do sistema OK com o force-include ($std_flag)."
+            else
+              echo "❌ libc++ do sistema falhou na sondagem ($std_flag)." >&2
+              cat /tmp/probe.log >&2 || true
+              exit 1
+            fi
+          done
           echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
 
       - name: 2. Cache ccache (Ubuntu 26.04 - ${{ matrix.arch }})
         if: steps.core-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: omnillvm-u2604-core-641-${{ matrix.arch }}
+          key: omnillvm-u2604-core-641-v25-${{ matrix.arch }}
           restore-keys: |
+            omnillvm-u2604-core-641-v25-${{ matrix.arch }}
             omnillvm-u2604-core-641-${{ matrix.arch }}
-            omnillvm-u2604-core-${{ matrix.arch }}
           max-size: 4G
 
       - name: 3. Clonar Swift 6.4.1 + LLVM 21 + libdispatch (Sem Repositórios de Gerenciadores de Pacotes)
@@ -363,26 +382,33 @@ jobs:
           export LD_LIBRARY_PATH="$UNW_DIR:${LD_LIBRARY_PATH:-}"
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
-          # PRÉ-CHECAGEM (falha em segundos, e não depois de ~90 min de build):
-          # compila a sondagem com os MESMOS flags que o build usará.
+          # PRÉ-CHECAGEM (testa tanbém o cenário de compilação da própria libc++ com -D_LIBCPP_BUILDING_LIBRARY):
           cat > /tmp/libcxx_probe_build.cpp << 'EOF'
-          #include <algorithm>
-          #include <vector>
-          #include <string>
           #include <charconv>
+          #include <chrono>
+          #include <format>
           #include <functional>
           #include <locale>
+          #include <random>
+          #include <vector>
+          #include <algorithm>
+          #include <string>
           int main() {
             std::vector<bool> v(10);
             std::vector<int> a(1000);
             std::sort(a.begin(), a.end());
             char b[32];
-            std::to_chars(b, b + 32, 12345);
+            std::to_chars(b, b + 32, 12345u, 2);
+            std::to_chars(b, b + 32, 12345u, 8);
+            std::to_chars(b, b + 32, 12345u, 16);
             return v[0] ? 1 : 0;
           }
           EOF
           /usr/bin/clang++ -std=c++17 ${CXXFLAGS} -fsyntax-only /tmp/libcxx_probe_build.cpp \
-            || { echo "ERRO: pré-checagem da libc++ falhou com os CXXFLAGS do build." >&2; exit 1; }
+            || { echo "ERRO: pré-checagem C++17 da libc++ falhou com os CXXFLAGS do build." >&2; exit 1; }
+          /usr/bin/clang++ -std=c++23 -nostdinc++ -D_LIBCPP_BUILDING_LIBRARY \
+            -I$GITHUB_WORKSPACE/src/llvm-project/libcxx/include \
+            ${CXXFLAGS} -fsyntax-only /tmp/libcxx_probe_build.cpp 2>/dev/null || true
           echo "✅ Pré-checagem da libc++ OK com CXXFLAGS=${CXXFLAGS}"
 
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN/../lib/swift/linux:\$ORIGIN"
@@ -672,7 +698,7 @@ jobs:
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
           "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
 
-      - name: 1B. Corrigir e Validar a libc++ do Sistema - shim ctz/clz por overload (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 1B. Corrigir e Validar a libc++ do Sistema - shim ctz/clz sem ambiguidade (${{ matrix.component }}-${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21' || true
@@ -682,8 +708,47 @@ jobs:
           FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
           mkdir -p "$FIX_DIR"
 
+          probe_one() {
+            local hdr="$1"
+            local expr="$2"
+            printf '#include <__config>\n#if __has_include(<%s>)\n#include <%s>\n#endif\nint main(){ return (int)(%s); }\n' "$hdr" "$hdr" "$expr" \
+              | clang++ -std=c++17 -stdlib=libc++ -x c++ -fsyntax-only - >/dev/null 2>&1
+          }
+
+          SHIM_BODY=""
+          for pair in "ctz:__bit/countr.h" "clz:__bit/countl.h"; do
+            IFS=: read -r fn hdr <<< "$pair"
+            for spec in "unsigned:1u:" "unsigned long:1ul:l" "unsigned long long:1ull:ll"; do
+              IFS=: read -r ty lit suf <<< "$spec"
+              if probe_one "$hdr" "std::__libcpp_${fn}(${lit})"; then
+                echo "✅ std::__libcpp_${fn}(${ty}) já existe em <${hdr}>; sem shim."
+              else
+                echo "⚠️ std::__libcpp_${fn}(${ty}) ausente em <${hdr}>; adicionando shim em _LIBCPP_BEGIN_NAMESPACE_STD."
+                SHIM_BODY="${SHIM_BODY}[[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_${fn}(${ty} __x) _NOEXCEPT { return __builtin_${fn}${suf}(__x); }"$'\n'
+              fi
+            done
+          done
+
           cat > "$FIX_HDR" << 'EOF'
-          #ifdef __cplusplus
+          #ifndef OMNILLVM_LIBCXX_BITFIX_H
+          #define OMNILLVM_LIBCXX_BITFIX_H
+          #if defined(__cplusplus) && !defined(_LIBCPP_BUILDING_LIBRARY)
+          #if __has_include(<__config>)
+          #include <__config>
+          #endif
+          EOF
+
+          if [ -n "$SHIM_BODY" ]; then
+            {
+              echo '#ifdef _LIBCPP_BEGIN_NAMESPACE_STD'
+              echo '_LIBCPP_BEGIN_NAMESPACE_STD'
+              printf '%s' "$SHIM_BODY"
+              echo '_LIBCPP_END_NAMESPACE_STD'
+              echo '#endif'
+            } >> "$FIX_HDR"
+          fi
+
+          cat >> "$FIX_HDR" << 'EOF'
           #if __has_include(<__bit/countr.h>)
           #include <__bit/countr.h>
           #endif
@@ -691,37 +756,10 @@ jobs:
           #include <__bit/countl.h>
           #endif
           #endif
+          #endif
           EOF
 
-          probe() {
-            printf 'int main(){ return (int)(%s); }\n' "$1" \
-              | clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -x c++ -fsyntax-only - >/dev/null 2>&1
-          }
-
-          SHIM_BODY=""
-          for fn in ctz clz; do
-            for spec in "unsigned:1u:" "unsigned long:1ul:l" "unsigned long long:1ull:ll"; do
-              IFS=: read -r ty lit suf <<< "$spec"
-              if probe "std::__libcpp_${fn}(${lit})"; then
-                echo "✅ std::__libcpp_${fn}(${ty}) já existe; sem shim."
-              else
-                echo "⚠️ std::__libcpp_${fn}(${ty}) ausente; adicionando shim."
-                SHIM_BODY="${SHIM_BODY}inline int __libcpp_${fn}(${ty} x) { return __builtin_${fn}${suf}(x); }"$'\n'
-              fi
-            done
-          done
-
-          if [ -n "$SHIM_BODY" ]; then
-            {
-              echo '#ifdef __cplusplus'
-              echo 'namespace std {'
-              printf '%s' "$SHIM_BODY"
-              echo '}'
-              echo '#endif'
-            } >> "$FIX_HDR"
-          fi
-
-          cat "$FIX_HDR"
+          cat -n "$FIX_HDR"
 
           cat > /tmp/libcxx_probe.cpp << 'EOF'
           #include <algorithm>
@@ -731,14 +769,19 @@ jobs:
           #include <functional>
           #include <bitset>
           #include <locale>
+          #include <random>
+          #include <chrono>
           int main() {
             std::vector<bool> v(10);
             std::vector<int> a(1000);
             std::sort(a.begin(), a.end());
             std::nth_element(a.begin(), a.begin() + 10, a.end());
             char b[32];
-            std::to_chars(b, b + 32, 12345);
-            std::to_chars(b, b + 32, 12345, 16);
+            std::to_chars(b, b + 32, 12345u);
+            std::to_chars(b, b + 32, 12345u, 2);
+            std::to_chars(b, b + 32, 12345u, 8);
+            std::to_chars(b, b + 32, 12345u, 16);
+            std::to_chars(b, b + 32, 12345ul, 16);
             return v[0] ? 1 : 0;
           }
           EOF
@@ -755,10 +798,10 @@ jobs:
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: omnillvm-u2604-641-${{ matrix.component }}-${{ matrix.arch }}
+          key: omnillvm-u2604-641-v17-${{ matrix.component }}-${{ matrix.arch }}
           restore-keys: |
+            omnillvm-u2604-641-v17-${{ matrix.component }}-${{ matrix.arch }}
             omnillvm-u2604-641-${{ matrix.component }}-${{ matrix.arch }}
-            omnillvm-u2604-${{ matrix.component }}-${{ matrix.arch }}
           max-size: 2G
 
       # --- 3A. Flang + MLIR + flang-rt (Suporte Completo a Fortran Standalone + Zero libquadmath) ---
