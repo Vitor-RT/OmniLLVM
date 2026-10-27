@@ -57,9 +57,9 @@ env:
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
   # Chaves de Cache para a arquitetura hermética (Sem Cargo/SPM + Com flang-rt nativo)
-  CORE_CACHE_REV: v23-swift-641-libcxx-shim
-  FRONTEND_CACHE_REV: v15-gnat-clang-cpp-libcxx-shim
-  PACKAGE_CACHE_REV: v15-audit-manifest
+  CORE_CACHE_REV: v24-swift-641-libcxx-shim-perfn
+  FRONTEND_CACHE_REV: v16-gnat-clang-cpp-libcxx-shim-perfn
+  PACKAGE_CACHE_REV: v16-audit-manifest
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -190,13 +190,14 @@ jobs:
 
       # ----------------------------------------------------------------------
       # Correção da libc++ do sistema.
-      # O pacote libc++ do Ubuntu 26.04 é inconsistente: __bit_reference, sort.h e __charconv/*
-      # chamam std::__libcpp_ctz/clz, mas essas funções só existem em __cxx03/__bit/*.
-      # Estratégia: gerar um header de force-include que (a) inclui __bit/countr.h e countl.h
-      # e (b) fornece um shim próprio (via __builtin_ctz/clz) SOMENTE para o que a sondagem
-      # mostrar que está ausente. Sem patch nos headers do sistema.
+      # O pacote libc++ do Ubuntu 26.04 é inconsistente: alguns headers chamam
+      # std::__libcpp_ctz/clz sem que a definição exista (ou esteja incluída).
+      # Estratégia: header de force-include que (a) inclui __bit/countr.h e countl.h e
+      # (b) acrescenta shim SOMENTE para cada overload (ctz/clz x unsigned/long/long long)
+      # que a sondagem isolada mostrar ausente. Nada de sondar via <vector>, que mascara
+      # a causa e gerava shims duplicados (erro "call to __libcpp_clz is ambiguous").
       # ----------------------------------------------------------------------
-      - name: 1B. Corrigir e Validar a libc++ do Sistema (shim ctz/clz)
+      - name: 1B. Corrigir e Validar a libc++ do Sistema (shim ctz/clz por overload)
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           echo "--- pacotes relacionados:"
@@ -207,7 +208,7 @@ jobs:
           FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
           mkdir -p "$FIX_DIR"
 
-          # Base: inclui os headers de contagem de bits quando existirem.
+          # Base: apenas inclui os headers de contagem de bits (sem shim ainda).
           cat > "$FIX_HDR" << 'EOF'
           #ifdef __cplusplus
           #if __has_include(<__bit/countr.h>)
@@ -219,40 +220,33 @@ jobs:
           #endif
           EOF
 
-          # Sonda se um símbolo está disponível após <vector>/<charconv>/<algorithm> com o force-include atual.
+          # Sonda uma expressão usando SOMENTE o header base (sem <vector>).
           probe() {
-            printf '#include <vector>\n#include <charconv>\n#include <algorithm>\nint main(){ return (int)(%s); }\n' "$1" \
+            printf 'int main(){ return (int)(%s); }\n' "$1" \
               | clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -x c++ -fsyntax-only - >/dev/null 2>&1
           }
 
-          if probe 'std::__libcpp_ctz(1u)'; then
-            echo "✅ std::__libcpp_ctz já disponível; sem shim."
-          else
-            echo "⚠️ std::__libcpp_ctz ausente; adicionando shim."
-            cat >> "$FIX_HDR" << 'EOF'
-          #ifdef __cplusplus
-          namespace std {
-          inline int __libcpp_ctz(unsigned x) { return __builtin_ctz(x); }
-          inline int __libcpp_ctz(unsigned long x) { return __builtin_ctzl(x); }
-          inline int __libcpp_ctz(unsigned long long x) { return __builtin_ctzll(x); }
-          }
-          #endif
-          EOF
-          fi
+          SHIM_BODY=""
+          for fn in ctz clz; do
+            for spec in "unsigned:1u:" "unsigned long:1ul:l" "unsigned long long:1ull:ll"; do
+              IFS=: read -r ty lit suf <<< "$spec"
+              if probe "std::__libcpp_${fn}(${lit})"; then
+                echo "✅ std::__libcpp_${fn}(${ty}) já existe; sem shim."
+              else
+                echo "⚠️ std::__libcpp_${fn}(${ty}) ausente; adicionando shim."
+                SHIM_BODY="${SHIM_BODY}inline int __libcpp_${fn}(${ty} x) { return __builtin_${fn}${suf}(x); }"$'\n'
+              fi
+            done
+          done
 
-          if probe 'std::__libcpp_clz(1u)'; then
-            echo "✅ std::__libcpp_clz já disponível; sem shim."
-          else
-            echo "⚠️ std::__libcpp_clz ausente; adicionando shim."
-            cat >> "$FIX_HDR" << 'EOF'
-          #ifdef __cplusplus
-          namespace std {
-          inline int __libcpp_clz(unsigned x) { return __builtin_clz(x); }
-          inline int __libcpp_clz(unsigned long x) { return __builtin_clzl(x); }
-          inline int __libcpp_clz(unsigned long long x) { return __builtin_clzll(x); }
-          }
-          #endif
-          EOF
+          if [ -n "$SHIM_BODY" ]; then
+            {
+              echo '#ifdef __cplusplus'
+              echo 'namespace std {'
+              printf '%s' "$SHIM_BODY"
+              echo '}'
+              echo '#endif'
+            } >> "$FIX_HDR"
           fi
 
           echo "--- conteúdo final do force-include:"
@@ -678,7 +672,7 @@ jobs:
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
           "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
 
-      - name: 1B. Corrigir e Validar a libc++ do Sistema - shim ctz/clz (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 1B. Corrigir e Validar a libc++ do Sistema - shim ctz/clz por overload (${{ matrix.component }}-${{ matrix.arch }})
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21' || true
@@ -700,38 +694,31 @@ jobs:
           EOF
 
           probe() {
-            printf '#include <vector>\n#include <charconv>\n#include <algorithm>\nint main(){ return (int)(%s); }\n' "$1" \
+            printf 'int main(){ return (int)(%s); }\n' "$1" \
               | clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -x c++ -fsyntax-only - >/dev/null 2>&1
           }
 
-          if probe 'std::__libcpp_ctz(1u)'; then
-            echo "✅ std::__libcpp_ctz já disponível; sem shim."
-          else
-            echo "⚠️ std::__libcpp_ctz ausente; adicionando shim."
-            cat >> "$FIX_HDR" << 'EOF'
-          #ifdef __cplusplus
-          namespace std {
-          inline int __libcpp_ctz(unsigned x) { return __builtin_ctz(x); }
-          inline int __libcpp_ctz(unsigned long x) { return __builtin_ctzl(x); }
-          inline int __libcpp_ctz(unsigned long long x) { return __builtin_ctzll(x); }
-          }
-          #endif
-          EOF
-          fi
+          SHIM_BODY=""
+          for fn in ctz clz; do
+            for spec in "unsigned:1u:" "unsigned long:1ul:l" "unsigned long long:1ull:ll"; do
+              IFS=: read -r ty lit suf <<< "$spec"
+              if probe "std::__libcpp_${fn}(${lit})"; then
+                echo "✅ std::__libcpp_${fn}(${ty}) já existe; sem shim."
+              else
+                echo "⚠️ std::__libcpp_${fn}(${ty}) ausente; adicionando shim."
+                SHIM_BODY="${SHIM_BODY}inline int __libcpp_${fn}(${ty} x) { return __builtin_${fn}${suf}(x); }"$'\n'
+              fi
+            done
+          done
 
-          if probe 'std::__libcpp_clz(1u)'; then
-            echo "✅ std::__libcpp_clz já disponível; sem shim."
-          else
-            echo "⚠️ std::__libcpp_clz ausente; adicionando shim."
-            cat >> "$FIX_HDR" << 'EOF'
-          #ifdef __cplusplus
-          namespace std {
-          inline int __libcpp_clz(unsigned x) { return __builtin_clz(x); }
-          inline int __libcpp_clz(unsigned long x) { return __builtin_clzl(x); }
-          inline int __libcpp_clz(unsigned long long x) { return __builtin_clzll(x); }
-          }
-          #endif
-          EOF
+          if [ -n "$SHIM_BODY" ]; then
+            {
+              echo '#ifdef __cplusplus'
+              echo 'namespace std {'
+              printf '%s' "$SHIM_BODY"
+              echo '}'
+              echo '#endif'
+            } >> "$FIX_HDR"
           fi
 
           cat "$FIX_HDR"
