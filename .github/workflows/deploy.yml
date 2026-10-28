@@ -52,7 +52,7 @@ env:
   GCC_ADA_BRANCH: releases/gcc-16
   CORE_CACHE_REV: v26-swift-641-libcxx-template-fallback
   FRONTEND_CACHE_REV: v18-gnat-clang-cpp-libcxx-template-fallback
-  PACKAGE_CACHE_REV: v16-audit-manifest
+  PACKAGE_CACHE_REV: v17-deep-rpath-fix
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -1178,14 +1178,45 @@ jobs:
           EOF
           chmod +x "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
 
+          # Garante que TODAS as bibliotecas compartilhadas (.so*) em subdiretórios (swift/linux,
+          # swift/linux/aarch64, swift/linux/x86_64, swift/host, lldb/swift, multiarch, etc.)
+          # tenham symlink direto no diretório raiz $TOOLCHAIN/lib/
+          find "$TOOLCHAIN/lib" -mindepth 2 \( -type f -o -type l \) -name "*.so*" 2>/dev/null | while read -r f; do
+            base=$(basename "$f")
+            if [ ! -e "$TOOLCHAIN/lib/$base" ]; then
+              ln -sf "$f" "$TOOLCHAIN/lib/$base" 2>/dev/null || true
+            fi
+          done
+
+          # Aplica RPATH relativo universal (cobrindo de 1 até 5 níveis de profundidade abaixo de $TOOLCHAIN/lib)
+          # em TODOS os executáveis e bibliotecas ELF (incluindo rust-objcopy, plugins e lldb/swift/*)
+          LIB_RPATH='$ORIGIN:$ORIGIN/..:$ORIGIN/../..:$ORIGIN/../../..:$ORIGIN/../../../..:$ORIGIN/../../../../..:$ORIGIN/swift/linux:$ORIGIN/swift/host:$ORIGIN/swift/host/compiler'
+          BIN_RPATH='$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN/../lib/swift/host:$ORIGIN/../lib/swift/host/compiler:$ORIGIN'
+
           find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
-            xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN/../lib/swift/host:$ORIGIN/../lib/swift/host/compiler:$ORIGIN' 2>/dev/null || true
+            xargs -P "$CORES" -n 10 patchelf --set-rpath "$BIN_RPATH" 2>/dev/null || true
 
-          find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
-            xargs -P "$CORES" -n 10 patchelf --set-rpath '$ORIGIN:$ORIGIN/swift/linux:$ORIGIN/swift/host:$ORIGIN/swift/host/compiler:$ORIGIN/..:$ORIGIN/../..' 2>/dev/null || true
+          find "$TOOLCHAIN/lib" -type f \( -executable -o -name "*.so*" \) ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
+            xargs -P "$CORES" -n 10 patchelf --set-rpath "$LIB_RPATH" 2>/dev/null || true
 
+          # Deduplicação física por Symlinks Relativos
           rdfind -makesymlinks true -makeresultsfile false "$TOOLCHAIN"
           symlinks -cr "$TOOLCHAIN"
+
+          # Re-garante que os symlinks em $TOOLCHAIN/lib e os RPATHs nos alvos físicos pós-rdfind estejam intactos
+          find "$TOOLCHAIN/lib" -mindepth 2 -type f -name "*.so*" 2>/dev/null | while read -r f; do
+            base=$(basename "$f")
+            if [ ! -e "$TOOLCHAIN/lib/$base" ]; then
+              ln -sf "$f" "$TOOLCHAIN/lib/$base" 2>/dev/null || true
+            fi
+          done
+          symlinks -cr "$TOOLCHAIN/lib"
+
+          find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
+            xargs -P "$CORES" -n 10 patchelf --set-rpath "$BIN_RPATH" 2>/dev/null || true
+
+          find "$TOOLCHAIN/lib" -type f \( -executable -o -name "*.so*" \) ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
+            xargs -P "$CORES" -n 10 patchelf --set-rpath "$LIB_RPATH" 2>/dev/null || true
 
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat.so"
