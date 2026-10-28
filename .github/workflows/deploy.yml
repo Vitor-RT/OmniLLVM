@@ -52,7 +52,7 @@ env:
   GCC_ADA_BRANCH: releases/gcc-16
   CORE_CACHE_REV: v26-swift-641-libcxx-template-fallback
   FRONTEND_CACHE_REV: v18-gnat-clang-cpp-libcxx-template-fallback
-  PACKAGE_CACHE_REV: v19-libgcc-shim-pure-llvm
+  PACKAGE_CACHE_REV: v20-gnat-llvm-passregistry-fix
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -1096,7 +1096,7 @@ jobs:
       - name: 1. Unificar Árvore, Ativar clang.cfg Pure LLVM, Deduplicar e Aplicar Strip Cirúrgico
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils
+          apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils python3
 
           CORES=$(nproc --all)
           mkdir -p /opt
@@ -1235,6 +1235,136 @@ jobs:
               patchelf --replace-needed libstdc++.so.6 libc++.so.1 --add-needed libc++abi.so.1 "$elf" 2>/dev/null || true
             fi
           done
+
+          # Corrige colisão de PassRegistry e double-free entre libclang-cpp.so e libLLVM.so no llvm-gnat1:
+          # 1. Neutraliza DT_INIT/DT_FINI/DT_INIT_ARRAY/DT_FINI_ARRAY duplicados na libclang-cpp.so*.
+          # 2. Reordena DT_NEEDED nos binários (como llvm-gnat1) para que libLLVM.so venha SEMPRE antes de libclang-cpp.so
+          #    (ou remove libclang-cpp.so se nenhum símbolo exclusivo de clang::* for referenciado).
+          TOOLCHAIN="$TOOLCHAIN" python3 - << 'PY_ELF_FIX'
+          import os, glob, struct, subprocess
+
+          toolchain = os.environ["TOOLCHAIN"]
+
+          for p in glob.glob(os.path.join(toolchain, "lib", "libclang-cpp.so*")):
+              if os.path.islink(p) or not os.path.isfile(p):
+                  continue
+              with open(p, "r+b") as f:
+                  data = bytearray(f.read())
+                  if data[:4] != b"\x7fELF":
+                      continue
+                  e_phoff = struct.unpack_from("<Q", data, 32)[0]
+                  e_phentsize = struct.unpack_from("<H", data, 54)[0]
+                  e_phnum = struct.unpack_from("<H", data, 56)[0]
+                  for i in range(e_phnum):
+                      p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = struct.unpack_from(
+                          "<IIQQQQQQ", data, e_phoff + i * e_phentsize
+                      )
+                      if p_type == 2:  # PT_DYNAMIC
+                          for pos in range(p_offset, p_offset + p_filesz, 16):
+                              d_tag, d_val = struct.unpack_from("<qQ", data, pos)
+                              if d_tag == 0:
+                                  break
+                              if d_tag in (12, 13, 25, 26, 27, 28):
+                                  struct.pack_into("<qQ", data, pos, 0x6FFFFFF0, 0)
+                          break
+                  f.seek(0)
+                  f.write(data)
+              print(f"Neutralized duplicate LLVM init/fini arrays in {p}")
+
+          nm_bin = os.path.join(toolchain, "bin", "llvm-nm")
+
+          def get_defined_syms(so_path):
+              if not os.path.exists(nm_bin):
+                  return set()
+              out = subprocess.check_output([nm_bin, "-D", "--defined-only", so_path], text=True, stderr=subprocess.DEVNULL)
+              syms = set()
+              for line in out.splitlines():
+                  parts = line.split()
+                  if len(parts) >= 3:
+                      syms.add(parts[-1].split("@")[0])
+              return syms
+
+          def get_undefined_syms(bin_path):
+              if not os.path.exists(nm_bin):
+                  return set()
+              out = subprocess.check_output([nm_bin, "-D", "-u", bin_path], text=True, stderr=subprocess.DEVNULL)
+              syms = set()
+              for line in out.splitlines():
+                  parts = line.split()
+                  if parts:
+                      syms.add(parts[-1].split("@")[0])
+              return syms
+
+          llvm_sos = [p for p in glob.glob(os.path.join(toolchain, "lib", "libLLVM*.so*")) if not os.path.islink(p) and os.path.isfile(p)]
+          clang_sos = [p for p in glob.glob(os.path.join(toolchain, "lib", "libclang-cpp.so*")) if not os.path.islink(p) and os.path.isfile(p)]
+          llvm_syms = get_defined_syms(llvm_sos[0]) if llvm_sos else set()
+          clang_syms = get_defined_syms(clang_sos[0]) if clang_sos else set()
+          clang_only_syms = clang_syms - llvm_syms
+
+          for b in glob.glob(os.path.join(toolchain, "bin", "*")):
+              if os.path.islink(b) or not os.path.isfile(b):
+                  continue
+              with open(b, "rb") as f:
+                  if f.read(4) != b"\x7fELF":
+                      continue
+              with open(b, "r+b") as f:
+                  data = bytearray(f.read())
+                  e_phoff = struct.unpack_from("<Q", data, 32)[0]
+                  e_phentsize = struct.unpack_from("<H", data, 54)[0]
+                  e_phnum = struct.unpack_from("<H", data, 56)[0]
+                  dyn_off = dyn_sz = 0
+                  loads = []
+                  for i in range(e_phnum):
+                      p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = struct.unpack_from(
+                          "<IIQQQQQQ", data, e_phoff + i * e_phentsize
+                      )
+                      if p_type == 2:
+                          dyn_off, dyn_sz = p_offset, p_filesz
+                      if p_type == 1:
+                          loads.append((p_vaddr, p_vaddr + p_filesz, p_offset))
+                  if not dyn_off:
+                      continue
+                  def vaddr_to_off(v):
+                      for s, e, o in loads:
+                          if s <= v < e:
+                              return o + (v - s)
+                      return 0
+                  strtab_va = 0
+                  slots = []
+                  for pos in range(dyn_off, dyn_off + dyn_sz, 16):
+                      d_tag, d_val = struct.unpack_from("<qQ", data, pos)
+                      if d_tag == 0:
+                          break
+                      if d_tag == 5:
+                          strtab_va = d_val
+                      if d_tag == 1:
+                          slots.append((pos, d_val))
+                  strtab_off = vaddr_to_off(strtab_va)
+                  def get_s(idx):
+                      end = data.find(b"\x00", strtab_off + idx)
+                      return data[strtab_off + idx:end].decode(errors="ignore")
+                  needed_names = [get_s(val) for _, val in slots]
+                  if not any("libclang-cpp" in n for n in needed_names):
+                      continue
+                  undef = get_undefined_syms(b)
+                  used_clang_only = undef & clang_only_syms
+                  print(f"{b}: DT_NEEDED={needed_names}, clang-only symbols used={len(used_clang_only)}")
+                  if not used_clang_only and clang_only_syms:
+                      for pos, val in slots:
+                          if "libclang-cpp" in get_s(val):
+                              struct.pack_into("<qQ", data, pos, 0x6FFFFFF0, 0)
+                      print(f"  -> Removed unused libclang-cpp from {b}")
+                  else:
+                      sorted_slots = sorted(
+                          slots,
+                          key=lambda x: (0 if "libLLVM" in get_s(x[1]) else (2 if "libclang-cpp" in get_s(x[1]) else 1))
+                      )
+                      for (pos, _), (_, new_val) in zip(slots, sorted_slots):
+                          struct.pack_into("<qQ", data, pos, 1, new_val)
+                      print(f"  -> Reordered DT_NEEDED of {b}: {[get_s(v) for _, v in sorted_slots]}")
+                  f.seek(0)
+                  f.write(data)
+          PY_ELF_FIX
 
           # Cria linker scripts Pure LLVM (redirecionando -lgcc_s e -lgcc para libunwind e compiler-rt builtins)
           # em profundidade >= 3 (rts-native/adalib e rustlib/*/lib) para atender rustc, flang, gnatlink e swiftc!
