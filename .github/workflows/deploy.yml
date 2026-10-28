@@ -52,7 +52,7 @@ env:
   GCC_ADA_BRANCH: releases/gcc-16
   CORE_CACHE_REV: v26-swift-641-libcxx-template-fallback
   FRONTEND_CACHE_REV: v18-gnat-clang-cpp-libcxx-template-fallback
-  PACKAGE_CACHE_REV: v17-deep-rpath-fix
+  PACKAGE_CACHE_REV: v18-pure-libcxx-no-libstdcpp
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -1115,6 +1115,10 @@ jobs:
                 "$TOOLCHAIN/bin/swift-build"* "$TOOLCHAIN/bin/swift-test"* \
                 "$TOOLCHAIN/bin/swift-run"* "$TOOLCHAIN/bin/swift-sdk"* 2>/dev/null || true
 
+          # Remove runtimes de sanitizers/xray/fuzzer/memprof/profile do compiler-rt (vinculados a libstdc++),
+          # preservando integralmente libclang_rt.builtins*.a e clang_rt.crtbegin/crtend*.o!
+          find "$TOOLCHAIN/lib" -name "libclang_rt.*" ! -name "libclang_rt.builtins*" -delete 2>/dev/null || true
+
           CRTBEGIN_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtbegin*.o" | head -n 1)
           if [ -n "$CRTBEGIN_FILE" ]; then
             CRT_DIR=$(dirname "$CRTBEGIN_FILE")
@@ -1217,6 +1221,13 @@ jobs:
 
           find "$TOOLCHAIN/lib" -type f \( -executable -o -name "*.so*" \) ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
             xargs -P "$CORES" -n 10 patchelf --set-rpath "$LIB_RPATH" 2>/dev/null || true
+
+          # Caso qualquer ELF tenha DT_NEEDED apontando para libstdc++.so.6, redireciona para libc++.so.1
+          find "$TOOLCHAIN/bin" "$TOOLCHAIN/lib" -type f ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | while IFS= read -r elf; do
+            if patchelf --print-needed "$elf" 2>/dev/null | grep -q '^libstdc++'; then
+              patchelf --replace-needed libstdc++.so.6 libc++.so.1 --add-needed libc++abi.so.1 "$elf" 2>/dev/null || true
+            fi
+          done
 
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat.so"
@@ -1437,7 +1448,7 @@ jobs:
           "$TOOLCHAIN/bin/swiftc" -O -use-ld=lld test_swift.swift -L"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin
           ./test_swift_bin
 
-          echo "-> [5/7] Testando Ada GNAT-LLVM 27.1 (llvm-gnatmake + libgnat-15.so do APT)..."
+          echo "-> [5/7] Testando Ada GNAT-LLVM 27.1 (llvm-gnatmake 100% sem gcc/gnat instalado no sistema!)..."
           cat << 'EOF' > hello_ada.adb
           with Ada.Text_IO; use Ada.Text_IO;
           procedure Hello_Ada is
