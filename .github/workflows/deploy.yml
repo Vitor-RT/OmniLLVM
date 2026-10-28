@@ -52,7 +52,7 @@ env:
   GCC_ADA_BRANCH: releases/gcc-16
   CORE_CACHE_REV: v26-swift-641-libcxx-template-fallback
   FRONTEND_CACHE_REV: v18-gnat-clang-cpp-libcxx-template-fallback
-  PACKAGE_CACHE_REV: v18-pure-libcxx-no-libstdcpp
+  PACKAGE_CACHE_REV: v19-libgcc-shim-pure-llvm
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -1139,6 +1139,7 @@ jobs:
           -fuse-ld=lld
           -B<CFGDIR>/../lib
           -L<CFGDIR>/../lib
+          -L<CFGDIR>/../lib/rts-native/adalib
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
 
@@ -1149,6 +1150,7 @@ jobs:
           -fuse-ld=lld
           -B<CFGDIR>/../lib
           -L<CFGDIR>/../lib
+          -L<CFGDIR>/../lib/rts-native/adalib
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
 
@@ -1156,8 +1158,13 @@ jobs:
           -fuse-ld=lld
           -B<CFGDIR>/../lib
           -L<CFGDIR>/../lib
+          -L<CFGDIR>/../lib/rts-native/adalib
           -Wl,-rpath,<CFGDIR>/../lib
           EOF
+
+          ln -sf clang.cfg "$TOOLCHAIN/bin/llvm-gcc.cfg"
+          ln -sf clang.cfg "$TOOLCHAIN/bin/gcc.cfg"
+          ln -sf flang.cfg "$TOOLCHAIN/bin/flang-new.cfg"
 
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
@@ -1185,7 +1192,7 @@ jobs:
           # Garante que TODAS as bibliotecas compartilhadas (.so*) em subdiretórios (swift/linux,
           # swift/linux/aarch64, swift/linux/x86_64, swift/host, lldb/swift, multiarch, etc.)
           # tenham symlink direto no diretório raiz $TOOLCHAIN/lib/
-          find "$TOOLCHAIN/lib" -mindepth 2 \( -type f -o -type l \) -name "*.so*" 2>/dev/null | while read -r f; do
+          find "$TOOLCHAIN/lib" -mindepth 2 \( -type f -o -type l \) -name "*.so*" ! -name "libgcc*" 2>/dev/null | while read -r f; do
             base=$(basename "$f")
             if [ ! -e "$TOOLCHAIN/lib/$base" ]; then
               ln -sf "$f" "$TOOLCHAIN/lib/$base" 2>/dev/null || true
@@ -1208,7 +1215,7 @@ jobs:
           symlinks -cr "$TOOLCHAIN"
 
           # Re-garante que os symlinks em $TOOLCHAIN/lib e os RPATHs nos alvos físicos pós-rdfind estejam intactos
-          find "$TOOLCHAIN/lib" -mindepth 2 -type f -name "*.so*" 2>/dev/null | while read -r f; do
+          find "$TOOLCHAIN/lib" -mindepth 2 -type f -name "*.so*" ! -name "libgcc*" 2>/dev/null | while read -r f; do
             base=$(basename "$f")
             if [ ! -e "$TOOLCHAIN/lib/$base" ]; then
               ln -sf "$f" "$TOOLCHAIN/lib/$base" 2>/dev/null || true
@@ -1226,6 +1233,17 @@ jobs:
           find "$TOOLCHAIN/bin" "$TOOLCHAIN/lib" -type f ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | while IFS= read -r elf; do
             if patchelf --print-needed "$elf" 2>/dev/null | grep -q '^libstdc++'; then
               patchelf --replace-needed libstdc++.so.6 libc++.so.1 --add-needed libc++abi.so.1 "$elf" 2>/dev/null || true
+            fi
+          done
+
+          # Cria linker scripts Pure LLVM (redirecionando -lgcc_s e -lgcc para libunwind e compiler-rt builtins)
+          # em profundidade >= 3 (rts-native/adalib e rustlib/*/lib) para atender rustc, flang, gnatlink e swiftc!
+          mkdir -p "$TOOLCHAIN/lib/rts-native/adalib"
+          for shim_dir in "$TOOLCHAIN/lib/rts-native/adalib" "$TOOLCHAIN/lib/rustlib"/*/lib; do
+            if [ -d "$shim_dir" ]; then
+              printf 'INPUT(-lunwind)\n' > "$shim_dir/libgcc_s.so"
+              printf 'INPUT(-lunwind)\n' > "$shim_dir/libgcc_eh.a"
+              printf 'INPUT(-lclang_rt.builtins)\n' > "$shim_dir/libgcc.a"
             fi
           done
 
