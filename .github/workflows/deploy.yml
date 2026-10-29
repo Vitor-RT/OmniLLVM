@@ -52,7 +52,7 @@ env:
   GCC_ADA_BRANCH: releases/gcc-16
   CORE_CACHE_REV: v26-swift-641-libcxx-template-fallback
   FRONTEND_CACHE_REV: v18-gnat-clang-cpp-libcxx-template-fallback
-  PACKAGE_CACHE_REV: v21-ada-ali-v16-sync
+  PACKAGE_CACHE_REV: v22-libunwind-a-linker-script
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -1366,11 +1366,16 @@ jobs:
                   f.write(data)
           PY_ELF_FIX
 
-          # Cria linker scripts Pure LLVM (redirecionando -lgcc_s e -lgcc para libunwind e compiler-rt builtins)
-          # em profundidade >= 3 (rts-native/adalib e rustlib/*/lib) para atender rustc, flang, gnatlink e swiftc!
+          # Cria linker scripts Pure LLVM para -l:libunwind.a, -l:libc++.a, -l:libc++abi.a (quando -static-libgcc é usado)
+          # e redireciona -lgcc_s / -lgcc em profundidade >= 3 (rts-native/adalib e rustlib/*/lib)!
+          printf 'INPUT(libunwind.so.1)\n' > "$TOOLCHAIN/lib/libunwind.a"
+          printf 'INPUT(libc++.so.1)\n' > "$TOOLCHAIN/lib/libc++.a"
+          printf 'INPUT(libc++abi.so.1)\n' > "$TOOLCHAIN/lib/libc++abi.a"
+
           mkdir -p "$TOOLCHAIN/lib/rts-native/adalib"
           for shim_dir in "$TOOLCHAIN/lib/rts-native/adalib" "$TOOLCHAIN/lib/rustlib"/*/lib; do
             if [ -d "$shim_dir" ]; then
+              printf 'INPUT(libunwind.so.1)\n' > "$shim_dir/libunwind.a"
               printf 'INPUT(-lunwind)\n' > "$shim_dir/libgcc_s.so"
               printf 'INPUT(-lunwind)\n' > "$shim_dir/libgcc_eh.a"
               printf 'INPUT(-lclang_rt.builtins)\n' > "$shim_dir/libgcc.a"
