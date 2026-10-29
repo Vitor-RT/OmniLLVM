@@ -52,7 +52,7 @@ env:
   GCC_ADA_BRANCH: releases/gcc-16
   CORE_CACHE_REV: v26-swift-641-libcxx-template-fallback
   FRONTEND_CACHE_REV: v18-gnat-clang-cpp-libcxx-template-fallback
-  PACKAGE_CACHE_REV: v20-gnat-llvm-passregistry-fix
+  PACKAGE_CACHE_REV: v21-ada-ali-v16-sync
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -1378,10 +1378,18 @@ jobs:
           done
 
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
+            # Sincroniza a assinatura de versão dos arquivos .ali da RTS (v15 -> v16) para compatibilidade
+            # com o frontend llvm-gnat1 / llvm-gnatbind (compilado sobre gcc-16 Ada sources) e aplica chmod 444!
+            chmod u+w "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
+            sed -i 's/V "GNAT Lib v[0-9]\+"/V "GNAT Lib v16"/g' "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
+            chmod 444 "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
+
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat-15.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnarl.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnarl-15.so"
+            printf 'INPUT(libgnat-15.so)\n' > "$TOOLCHAIN/lib/rts-native/adalib/libgnat.a"
+            printf 'INPUT(libgnarl-15.so)\n' > "$TOOLCHAIN/lib/rts-native/adalib/libgnarl.a"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/libgnat-15.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/libgnat.so"
             ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/libgnarl-15.so"
