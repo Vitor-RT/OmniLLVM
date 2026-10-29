@@ -52,7 +52,7 @@ env:
   GCC_ADA_BRANCH: releases/gcc-16
   CORE_CACHE_REV: v26-swift-641-libcxx-template-fallback
   FRONTEND_CACHE_REV: v18-gnat-clang-cpp-libcxx-template-fallback
-  PACKAGE_CACHE_REV: v22-libunwind-a-linker-script
+  PACKAGE_CACHE_REV: v23-crtbegins-crtends-fix
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -1119,14 +1119,18 @@ jobs:
           # preservando integralmente libclang_rt.builtins*.a e clang_rt.crtbegin/crtend*.o!
           find "$TOOLCHAIN/lib" -name "libclang_rt.*" ! -name "libclang_rt.builtins*" -delete 2>/dev/null || true
 
-          CRTBEGIN_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtbegin*.o" | head -n 1)
-          if [ -n "$CRTBEGIN_FILE" ]; then
+          # O compiler-rt gera clang_rt.crtbegin*.o e clang_rt.crtend*.o (já em modo PIC);
+          # expomos crtbegin.o, crtbeginS.o, crtbeginT.o, crtend.o e crtendS.o apontando para os arquivos reais!
+          CRTBEGIN_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtbegin*.o" -type f | head -n 1)
+          CRTEND_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtend*.o" -type f | head -n 1)
+          if [ -n "$CRTBEGIN_FILE" ] && [ -n "$CRTEND_FILE" ]; then
             CRT_DIR=$(dirname "$CRTBEGIN_FILE")
-            ln -sf "$CRT_DIR"/clang_rt.crtbegin*.o "$TOOLCHAIN/lib/crtbegin.o" 2>/dev/null || true
-            ln -sf "$CRT_DIR"/clang_rt.crtbeginS*.o "$TOOLCHAIN/lib/crtbeginS.o" 2>/dev/null || true
-            ln -sf "$CRT_DIR"/clang_rt.crtbeginT*.o "$TOOLCHAIN/lib/crtbeginT.o" 2>/dev/null || true
-            ln -sf "$CRT_DIR"/clang_rt.crtend*.o "$TOOLCHAIN/lib/crtend.o" 2>/dev/null || true
-            ln -sf "$CRT_DIR"/clang_rt.crtendS*.o "$TOOLCHAIN/lib/crtendS.o" 2>/dev/null || true
+            rm -f "$TOOLCHAIN/lib/crtbegin"*.o "$TOOLCHAIN/lib/crtend"*.o
+            cp -af "$CRTBEGIN_FILE" "$TOOLCHAIN/lib/crtbegin.o"
+            cp -af "$CRTBEGIN_FILE" "$TOOLCHAIN/lib/crtbeginS.o"
+            cp -af "$CRTBEGIN_FILE" "$TOOLCHAIN/lib/crtbeginT.o"
+            cp -af "$CRTEND_FILE" "$TOOLCHAIN/lib/crtend.o"
+            cp -af "$CRTEND_FILE" "$TOOLCHAIN/lib/crtendS.o"
             BUILTINS_A=$(find "$CRT_DIR" -name "libclang_rt.builtins*.a" | head -n 1)
             if [ -n "$BUILTINS_A" ]; then
               ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libclang_rt.builtins.a"
@@ -1165,6 +1169,7 @@ jobs:
           ln -sf clang.cfg "$TOOLCHAIN/bin/llvm-gcc.cfg"
           ln -sf clang.cfg "$TOOLCHAIN/bin/gcc.cfg"
           ln -sf flang.cfg "$TOOLCHAIN/bin/flang-new.cfg"
+          ln -sf flang.cfg "$TOOLCHAIN/bin/flang-21.cfg"
 
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
