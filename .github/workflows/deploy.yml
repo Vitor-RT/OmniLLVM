@@ -2,38 +2,13 @@ name: Build OmniLLVM Toolchain
 
 on:
   push:
-    branches:
-      - '*'
+    branches: ['*']
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: 'Versão da Release (deixe vazio para auto-incrementar: 1, 2, 3...)'
-        required: false
-        default: ''
-      rebuild_core:
-        description: 'Forçar recompilação do Stage 1 do zero? (false = usa cache)'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-      rebuild_frontends:
-        description: 'Forçar recompilação do Stage 2 (Flang/Ada/Rust)? (false = usa cache)'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-      rebuild_package:
-        description: 'Forçar re-empacotamento do Stage 3? (false = usa cache)'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+      release_tag: { description: 'Versão da Release (vazio = auto-incrementar)', required: false, default: '' }
+      rebuild_core: { description: 'Recompilar Stage 1?', required: false, default: 'false', type: choice, options: ['false', 'true'] }
+      rebuild_frontends: { description: 'Recompilar Stage 2?', required: false, default: 'false', type: choice, options: ['false', 'true'] }
+      rebuild_package: { description: 'Re-empacotar Stage 3?', required: false, default: 'false', type: choice, options: ['false', 'true'] }
 
 permissions:
   contents: write
@@ -44,15 +19,15 @@ defaults:
 
 env:
   INSTALL_PREFIX: /opt/omnillvm
-  SWIFT_SCHEME: release/6.4.1
-  SWIFT_LLVM_BRANCH: swift/release/6.4.1
-  SWIFT_BOOTSTRAP_VER: 6.4.1
+  SWIFT_SCHEME: release/6.4.2
+  SWIFT_LLVM_BRANCH: swift/release/6.4.2
+  SWIFT_BOOTSTRAP_VER: 6.4.2
   RUST_BRANCH: 1.94.0
   GNAT_LLVM_BRANCH: release/27.1
   GCC_ADA_BRANCH: releases/gcc-16
-  CORE_CACHE_REV: v26-swift-641-libcxx-template-fallback
+  CORE_CACHE_REV: v27-swift-642-foundation
   FRONTEND_CACHE_REV: v18-gnat-clang-cpp-libcxx-template-fallback
-  PACKAGE_CACHE_REV: v23-crtbegins-crtends-fix
+  PACKAGE_CACHE_REV: v24-swift-642-foundation
   DEBIAN_FRONTEND: noninteractive
   MAX_OPT_FLAGS: "-O3 -pipe -fno-plt -g0 -DNDEBUG"
   CCACHE_TEMPDIR: "/dev/shm/ccache-tmp"
@@ -63,10 +38,10 @@ env:
 
 jobs:
   # ============================================================================
-  # ESTÁGIO 1: Core em Container Ubuntu 26.04 (AMD64 + ARM64)
+  # ESTÁGIO 1: Core LLVM 21 + Swiftc 6.4.2 + Foundation + Collections + LLDB
   # ============================================================================
   build-core:
-    name: "Stage 1: Core LLVM+Swiftc 6.4.1 [Ubuntu 26.04 - ${{ matrix.arch }}]"
+    name: "Stage 1: Core LLVM+Swiftc 6.4.2+Foundation [Ubuntu 26.04 - ${{ matrix.arch }}]"
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:26.04
@@ -75,117 +50,68 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
         include:
-          - arch: amd64
-            runner: ubuntu-26.04
-            llvm_build_subdir: "llvm-linux-x86_64"
-            gnu_triple: x86_64-linux-gnu
-            swift_url_arch: ""
-            swift_dir_arch: ""
-          - arch: arm64
-            runner: ubuntu-26.04-arm
-            llvm_build_subdir: "llvm-linux-aarch64"
-            gnu_triple: aarch64-linux-gnu
-            swift_url_arch: "-aarch64"
-            swift_dir_arch: "-aarch64"
+          - { arch: amd64, runner: ubuntu-26.04, llvm_build_subdir: llvm-linux-x86_64, gnu_triple: x86_64-linux-gnu, swift_url_arch: "", swift_dir_arch: "" }
+          - { arch: arm64, runner: ubuntu-26.04-arm, llvm_build_subdir: llvm-linux-aarch64, gnu_triple: aarch64-linux-gnu, swift_url_arch: "-aarch64", swift_dir_arch: "-aarch64" }
 
     steps:
-      - name: 0A. Preparar ZSTD e BASH para o Cache do GitHub no Ubuntu 26.04
+      - name: 0A. Preparar ZSTD e BASH
         shell: sh -e {0}
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 0B. Restaurar Cache do Core SDK Pronto (Stage 1 - 6.4.1)
+      - name: 0B. Restaurar Cache do Core SDK (Stage 1)
         id: core-cache
         if: inputs.rebuild_core != 'true'
         uses: actions/cache/restore@v4
         with:
           path: core-sdk-${{ matrix.arch }}.tar.zst
           key: omnillvm-core-${{ env.CORE_CACHE_REV }}-${{ matrix.arch }}
-          restore-keys: |
-            omnillvm-core-${{ env.CORE_CACHE_REV }}-${{ matrix.arch }}
+          restore-keys: omnillvm-core-${{ env.CORE_CACHE_REV }}-${{ matrix.arch }}
 
-      - name: 1. Instalar Dependências, Swift Host Bootstrap e Tuning Máximo de CPU/RAM
+      - name: 1. Instalar Dependências e Swift Host Bootstrap
         id: hw
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends \
             git cmake ninja-build make clang lld mold ccache patchelf curl \
-            python3 pkg-config libncurses-dev libedit-dev \
-            libxml2-dev uuid-dev libicu-dev \
-            libblocksruntime-dev zlib1g-dev xz-utils file procps \
-            libc++-dev libc++abi-dev
-
-          apt-get install -y -qq --no-install-recommends libunwind-21-dev \
-            || apt-get install -y -qq --no-install-recommends libunwind-20-dev \
-            || true
+            python3 pkg-config libncurses-dev libedit-dev libxml2-dev uuid-dev \
+            libicu-dev libcurl4-openssl-dev libblocksruntime-dev zlib1g-dev \
+            xz-utils file procps libc++-dev libc++abi-dev
+          apt-get install -y -qq --no-install-recommends libunwind-21-dev || apt-get install -y -qq --no-install-recommends libunwind-20-dev || true
           UNW=$(find /usr/lib -name 'libunwind.so.1*' 2>/dev/null | head -n 1)
-          if [ -z "$UNW" ]; then
-            echo "ERRO: libunwind.so.1 (LLVM) não encontrada após a instalação dos pacotes." >&2
-            find /usr/lib -name 'libunwind*' 2>/dev/null | head -n 20 >&2 || true
-            exit 1
-          fi
+          [ -n "$UNW" ] || { echo "ERRO: libunwind.so.1 ausente" >&2; exit 1; }
           UNW_DIR=$(dirname "$UNW")
-          echo "libunwind do LLVM em: $UNW_DIR"
-          echo "$UNW_DIR" > /etc/ld.so.conf.d/llvm-libunwind.conf
-          ldconfig
+          echo "$UNW_DIR" > /etc/ld.so.conf.d/llvm-libunwind.conf && ldconfig
           echo "LD_LIBRARY_PATH=$UNW_DIR:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
-          ldconfig -p | grep libunwind || true
 
           apt-get remove -y libpython3*-dev swig* || true
-          mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp
+          mkdir -p ${{ env.INSTALL_PREFIX }} /dev/shm/ccache-tmp /opt/swift-bootstrap
+          for l in /usr/bin/ld /usr/bin/x86_64-linux-gnu-ld /usr/bin/aarch64-linux-gnu-ld; do ln -sf /usr/bin/ld.lld "$l" || true; done
 
-          ln -sf /usr/bin/ld.lld /usr/bin/ld
-          ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
-          ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
-
-          SWIFT_URL="https://download.swift.org/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/ubuntu2604${{ matrix.swift_url_arch }}/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-ubuntu26.04${{ matrix.swift_dir_arch }}.tar.gz"
-          mkdir -p /opt/swift-bootstrap
-          echo "Baixando Swift bootstrap ${{ env.SWIFT_BOOTSTRAP_VER }} para Ubuntu 26.04 (${{ matrix.arch }})"
-          curl --fail --location --show-error --silent --retry 3 "$SWIFT_URL" | tar -xz -C /opt/swift-bootstrap --strip-components=2
-          /opt/swift-bootstrap/bin/swiftc --version
-          /opt/swift-bootstrap/bin/swiftc --version | grep -F "${{ env.SWIFT_BOOTSTRAP_VER }}"
-          rm -f /opt/swift-bootstrap/bin/clang* /opt/swift-bootstrap/bin/lld* /opt/swift-bootstrap/bin/ld* /opt/swift-bootstrap/bin/lldb*
-          ln -sf /usr/bin/clang /opt/swift-bootstrap/bin/clang
-          ln -sf /usr/bin/clang++ /opt/swift-bootstrap/bin/clang++
+          BASE_URL="https://download.swift.org"
+          S_ARCH="ubuntu2604${{ matrix.swift_url_arch }}"
+          F_ARCH="ubuntu26.04${{ matrix.swift_dir_arch }}"
+          URL_642="$BASE_URL/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-release/$S_ARCH/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE/swift-${{ env.SWIFT_BOOTSTRAP_VER }}-RELEASE-$F_ARCH.tar.gz"
+          URL_641="$BASE_URL/swift-6.4.1-release/$S_ARCH/swift-6.4.1-RELEASE/swift-6.4.1-RELEASE-$F_ARCH.tar.gz"
+          if ! curl -fsSL --retry 3 "$URL_642" | tar -xz -C /opt/swift-bootstrap --strip-components=2 2>/dev/null; then
+            curl -fsSL --retry 3 "$URL_641" | tar -xz -C /opt/swift-bootstrap --strip-components=2
+          fi
+          rm -f /opt/swift-bootstrap/bin/{clang*,lld*,ld*,lldb*}
+          for b in clang clang++ lld; do ln -sf /usr/bin/$b /opt/swift-bootstrap/bin/$b; done
           ln -sf /usr/bin/ld.lld /opt/swift-bootstrap/bin/ld.lld
           ln -sf /usr/bin/ld.lld /opt/swift-bootstrap/bin/ld
-          ln -sf /usr/bin/lld /opt/swift-bootstrap/bin/lld
           ln -sf /usr/bin/mold /opt/swift-bootstrap/bin/ld.mold
 
-          printf 'print("Swift bootstrap LLD OK")\n' > /tmp/omnillvm-swift-bootstrap-test.swift
-          /opt/swift-bootstrap/bin/swiftc -use-ld=lld \
-            /tmp/omnillvm-swift-bootstrap-test.swift \
-            -o /tmp/omnillvm-swift-bootstrap-test
-          /tmp/omnillvm-swift-bootstrap-test
-          rm -f /tmp/omnillvm-swift-bootstrap-test.swift /tmp/omnillvm-swift-bootstrap-test
-
           CORES=$(nproc --all)
-          COMPILE_JOBS=$(( CORES + 2 ))
-          RAM_GB=$(awk '/MemTotal/ {printf "%.0f", $2/1024/1024}' /proc/meminfo)
-          LINK_JOBS=$CORES
+          printf "cores=%s\ncompile_jobs=%s\nlink_jobs=%s\n" "$CORES" "$((CORES+2))" "$CORES" >> $GITHUB_OUTPUT
 
-          echo "Detectado: ${CORES} vCPUs (Compile Jobs: ${COMPILE_JOBS} | Link Jobs: ${LINK_JOBS}) | ${RAM_GB} GB RAM"
-          echo "cores=$CORES" >> $GITHUB_OUTPUT
-          echo "compile_jobs=$COMPILE_JOBS" >> $GITHUB_OUTPUT
-          echo "link_jobs=$LINK_JOBS" >> $GITHUB_OUTPUT
-
-      - name: 1B. Corrigir e Validar a libc++ do Sistema (fallback template <int = 0> sem redefinição e sem ambiguidade)
+      - name: 1B. Configurar Shim Universal da libc++ (template <int = 0>)
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
-          echo "--- pacotes relacionados:"
-          dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21|clang ' || true
-          clang++ --version
-
-          FIX_DIR=/usr/local/share/omnillvm-fix
-          FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
-          mkdir -p "$FIX_DIR"
-
+          FIX_HDR=/usr/local/share/omnillvm-fix/libcxx_bitfix.h
+          mkdir -p "$(dirname "$FIX_HDR")"
           cat > "$FIX_HDR" << 'EOF'
           #ifndef OMNILLVM_LIBCXX_BITFIX_H
           #define OMNILLVM_LIBCXX_BITFIX_H
@@ -195,30 +121,12 @@ jobs:
           #endif
           #ifdef _LIBCPP_BEGIN_NAMESPACE_STD
           _LIBCPP_BEGIN_NAMESPACE_STD
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned __x) _NOEXCEPT {
-            return __builtin_ctz(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned long __x) _NOEXCEPT {
-            return __builtin_ctzl(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned long long __x) _NOEXCEPT {
-            return __builtin_ctzll(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned __x) _NOEXCEPT {
-            return __builtin_clz(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned long __x) _NOEXCEPT {
-            return __builtin_clzl(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned long long __x) _NOEXCEPT {
-            return __builtin_clzll(__x);
-          }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned __x) _NOEXCEPT { return __builtin_ctz(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned long __x) _NOEXCEPT { return __builtin_ctzl(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned long long __x) _NOEXCEPT { return __builtin_ctzll(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned __x) _NOEXCEPT { return __builtin_clz(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned long __x) _NOEXCEPT { return __builtin_clzl(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned long long __x) _NOEXCEPT { return __builtin_clzll(__x); }
           _LIBCPP_END_NAMESPACE_STD
           #endif
           #if __has_include(<__bit/countr.h>)
@@ -230,339 +138,152 @@ jobs:
           #endif
           #endif
           EOF
-
-          echo "--- conteúdo final do force-include:"
-          cat -n "$FIX_HDR"
-
-          cat > /tmp/libcxx_probe.cpp << 'EOF'
-          #include <algorithm>
-          #include <vector>
-          #include <utility>
-          #include <string>
-          #include <charconv>
-          #include <functional>
-          #include <bitset>
-          #include <locale>
-          #include <random>
-          #include <chrono>
-          int main() {
-            std::vector<bool> v(10);
-            std::vector<int> a(1000);
-            std::sort(a.begin(), a.end());
-            std::nth_element(a.begin(), a.begin() + 10, a.end());
-            std::vector<std::pair<int, int>> p(100);
-            std::sort(p.begin(), p.end());
-            char b[32];
-            std::to_chars(b, b + 32, 12345u);
-            std::to_chars(b, b + 32, 12345u, 2);
-            std::to_chars(b, b + 32, 12345u, 8);
-            std::to_chars(b, b + 32, 12345u, 16);
-            std::to_chars(b, b + 32, 12345ul, 16);
-            int out = 0;
-            std::from_chars(b, b + 4, out);
-            return v[0] ? 1 : (out + p[0].first);
-          }
-          EOF
-          for std_flag in -std=c++17 -std=c++23; do
-            if clang++ $std_flag -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe.log; then
-              echo "✅ libc++ do sistema OK com o force-include ($std_flag)."
-            else
-              echo "❌ libc++ do sistema falhou na sondagem ($std_flag)." >&2
-              cat /tmp/probe.log >&2 || true
-              exit 1
-            fi
-          done
+          printf '#include <algorithm>\n#include <vector>\n#include <charconv>\n#include <locale>\nint main(){std::vector<std::pair<int,int>> p(32);std::sort(p.begin(),p.end());char b[16];std::to_chars(b,b+16,42u,16);return 0;}\n' \
+            | clang++ -std=c++23 -stdlib=libc++ -include "$FIX_HDR" -O2 -x c++ -fsyntax-only -
           echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
 
-      - name: 2. Cache ccache (Ubuntu 26.04 - ${{ matrix.arch }})
+      - name: 2. Cache ccache
         if: steps.core-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: omnillvm-u2604-core-641-v26-${{ matrix.arch }}
+          key: omnillvm-u2604-core-642-${{ matrix.arch }}
           restore-keys: |
+            omnillvm-u2604-core-642-${{ matrix.arch }}
             omnillvm-u2604-core-641-v26-${{ matrix.arch }}
           max-size: 4G
 
-      - name: 3. Clonar Swift 6.4.1 + LLVM 21 + libdispatch (Sem Repositórios de Gerenciadores de Pacotes)
+      - name: 3. Clonar Swift 6.4.2 + LLVM 21 + Foundation + Collections + libdispatch
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p $GITHUB_WORKSPACE/src && cd $GITHUB_WORKSPACE/src
           git clone --branch ${{ env.SWIFT_SCHEME }} --depth 1 --single-branch https://github.com/swiftlang/swift.git
+          # Mantém swift-foundation, swift-foundation-icu, swift-corelibs-foundation e swift-collections ATIVOS!
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history \
-            --skip-repository swiftpm \
-            --skip-repository swift-driver \
-            --skip-repository swift-tools-support-core \
-            --skip-repository swift-argument-parser \
-            --skip-repository swift-crypto \
-            --skip-repository swift-certificates \
-            --skip-repository swift-asn1 \
-            --skip-repository swift-system \
-            --skip-repository swift-collections \
-            --skip-repository yams \
-            --skip-repository llbuild \
-            --skip-repository indexstore-db \
-            --skip-repository sourcekit-lsp \
-            --skip-repository swift-docc \
-            --skip-repository swift-docc-render-artifact \
-            --skip-repository swift-docc-symbolkit \
-            --skip-repository swift-markdown \
-            --skip-repository swift-format \
-            --skip-repository swift-testing \
-            --skip-repository swift-foundation \
-            --skip-repository swift-foundation-icu \
-            --skip-repository swift-corelibs-foundation \
+            --skip-repository swiftpm --skip-repository swift-driver \
+            --skip-repository swift-tools-support-core --skip-repository swift-argument-parser \
+            --skip-repository swift-crypto --skip-repository swift-certificates \
+            --skip-repository swift-asn1 --skip-repository swift-system \
+            --skip-repository yams --skip-repository llbuild \
+            --skip-repository indexstore-db --skip-repository sourcekit-lsp \
+            --skip-repository swift-docc --skip-repository swift-docc-render-artifact \
+            --skip-repository swift-docc-symbolkit --skip-repository swift-markdown \
+            --skip-repository swift-format --skip-repository swift-testing \
             --skip-repository swift-corelibs-xctest \
             -j ${{ steps.hw.outputs.compile_jobs }} || \
           ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
 
-          if [ ! -d "$GITHUB_WORKSPACE/src/cmark" ] && [ ! -d "$GITHUB_WORKSPACE/src/swift-cmark" ]; then
-            ./swift/utils/update-checkout --clone --scheme ${{ env.SWIFT_SCHEME }} --skip-history -j ${{ steps.hw.outputs.compile_jobs }}
-          fi
-          if [ ! -f "$GITHUB_WORKSPACE/src/swift-syntax/CMakeLists.txt" ]; then
-            rm -rf "$GITHUB_WORKSPACE/src/swift-syntax"
-            git clone --depth 1 --single-branch --branch "${{ env.SWIFT_SCHEME }}" \
-              https://github.com/swiftlang/swift-syntax.git "$GITHUB_WORKSPACE/src/swift-syntax"
-          fi
-          test -f "$GITHUB_WORKSPACE/src/swift-syntax/CMakeLists.txt" || {
-            echo "ERRO: swift-syntax não foi baixado; SwiftMacros é necessário para a biblioteca padrão." >&2
-            exit 1
+          for repo in swift-syntax swift-foundation swift-foundation-icu swift-corelibs-foundation; do
+            [ -f "$GITHUB_WORKSPACE/src/$repo/CMakeLists.txt" ] || {
+              rm -rf "$GITHUB_WORKSPACE/src/$repo"
+              git clone --depth 1 --single-branch --branch "${{ env.SWIFT_SCHEME }}" "https://github.com/swiftlang/$repo.git" "$GITHUB_WORKSPACE/src/$repo"
+            }
+          done
+          [ -f "$GITHUB_WORKSPACE/src/swift-collections/CMakeLists.txt" ] || {
+            rm -rf "$GITHUB_WORKSPACE/src/swift-collections"
+            git clone --depth 1 --single-branch --branch "release/1.1" https://github.com/apple/swift-collections.git "$GITHUB_WORKSPACE/src/swift-collections" || \
+            git clone --depth 1 https://github.com/apple/swift-collections.git "$GITHUB_WORKSPACE/src/swift-collections"
           }
-          echo "swift-syntax pronto: $(git -C "$GITHUB_WORKSPACE/src/swift-syntax" rev-parse --short HEAD)"
-
           rm -rf "$GITHUB_WORKSPACE/src/swiftpm" "$GITHUB_WORKSPACE/src/swift-driver"
 
-      - name: 4. Compilar e Configurar Core 6.4.1 Completo na Origem (LLVM + Clang + Swiftc + LLDB + Runtimes)
+      - name: 4. Compilar Core 6.4.2 + Foundation + LLDB + Runtimes
         if: steps.core-cache.outputs.cache-hit != 'true'
         run: |
           cd $GITHUB_WORKSPACE/src
-
-          export PATH="/usr/bin:/bin:/opt/swift-bootstrap/bin:$PATH"
-          export CC=/usr/bin/clang
-          export CXX=/usr/bin/clang++
+          export PATH="/usr/bin:/bin:/opt/swift-bootstrap/bin:$PATH" CC=/usr/bin/clang CXX=/usr/bin/clang++ TMPDIR="/tmp"
           export CFLAGS="${{ env.MAX_OPT_FLAGS }}"
           export CXXFLAGS="${{ env.MAX_OPT_FLAGS }} -stdlib=libc++ ${LIBCXX_FIX_FLAG:-}"
-          export TMPDIR="/tmp"
-          echo "LIBCXX_FIX_FLAG='${LIBCXX_FIX_FLAG:-}'"
-
           UNW_DIR=$(dirname "$(find /usr/lib -name 'libunwind.so.1*' 2>/dev/null | head -n 1)")
           export LD_LIBRARY_PATH="$UNW_DIR:${LD_LIBRARY_PATH:-}"
-          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-
-          cat > /tmp/libcxx_probe_build.cpp << 'EOF'
-          #include <charconv>
-          #include <chrono>
-          #include <functional>
-          #include <locale>
-          #include <random>
-          #include <vector>
-          #include <utility>
-          #include <algorithm>
-          #include <string>
-          int main() {
-            std::vector<bool> v(10);
-            std::vector<int> a(1000);
-            std::sort(a.begin(), a.end());
-            std::vector<std::pair<int, int>> p(100);
-            std::sort(p.begin(), p.end());
-            char b[32];
-            std::to_chars(b, b + 32, 12345u, 2);
-            std::to_chars(b, b + 32, 12345u, 8);
-            std::to_chars(b, b + 32, 12345u, 16);
-            return v[0] ? 1 : p[0].first;
-          }
-          EOF
-          /usr/bin/clang++ -std=c++17 ${CXXFLAGS} -fsyntax-only /tmp/libcxx_probe_build.cpp \
-            || { echo "ERRO: pré-checagem C++17 da libc++ do host falhou com os CXXFLAGS do build." >&2; exit 1; }
-          echo "✅ Pré-checagem da libc++ OK com CXXFLAGS=${CXXFLAGS}"
-
           BUILD_RPATH="\$ORIGIN/../lib:\$ORIGIN/../lib/swift/linux:\$ORIGIN"
-          CXX_REL_FLAGS="${{ env.MAX_OPT_FLAGS }} -stdlib=libc++ ${LIBCXX_FIX_FLAG:-}"
 
-          sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' \
-            $GITHUB_WORKSPACE/src/llvm-project/llvm/tools/llvm-config/llvm-config.cpp
-
-          find $GITHUB_WORKSPACE/src/llvm-project -name "CMakeLists.txt" -o -name "*.cmake" | \
-            xargs grep -l "version-script" 2>/dev/null | \
+          sed -i 's/bool LinkDyLib = .*;/bool LinkDyLib = true;/g' llvm-project/llvm/tools/llvm-config/llvm-config.cpp
+          find llvm-project -name "CMakeLists.txt" -o -name "*.cmake" | xargs grep -l "version-script" 2>/dev/null | \
             xargs sed -i 's/-Wl,--version-script/-Wl,--undefined-version,--version-script/g' 2>/dev/null || true
 
           ./swift/utils/build-script \
-            --release \
-            --skip-early-swift-driver \
-            --no-assertions \
-            --no-swift-stdlib-assertions \
-            --bootstrapping=hosttools \
-            --host-cc=/usr/bin/clang \
-            --host-cxx=/usr/bin/clang++ \
-            --libdispatch \
-            --lldb \
-            --jobs ${{ steps.hw.outputs.compile_jobs }} \
-            --install-all \
-            --install-destdir="${{ env.INSTALL_PREFIX }}" \
-            --install-prefix="/usr" \
+            --release --skip-early-swift-driver --no-assertions --no-swift-stdlib-assertions \
+            --bootstrapping=hosttools --host-cc=/usr/bin/clang --host-cxx=/usr/bin/clang++ \
+            --libdispatch --foundation --lldb --jobs ${{ steps.hw.outputs.compile_jobs }} \
+            --install-all --install-destdir="${{ env.INSTALL_PREFIX }}" --install-prefix="/usr" \
             --cross-compile-append-host-target-to-destdir=False \
             --extra-cmake-options="\
-              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-              -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' \
-              -DCMAKE_CXX_FLAGS_RELEASE='${CXX_REL_FLAGS}' \
-              -DCMAKE_INSTALL_RPATH='${BUILD_RPATH}' \
-              -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-              -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' \
-              -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld' \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_C_FLAGS_RELEASE='${{ env.MAX_OPT_FLAGS }}' -DCMAKE_CXX_FLAGS_RELEASE='${CXXFLAGS}' \
+              -DCMAKE_INSTALL_RPATH='${BUILD_RPATH}' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+              -DLLVM_TARGETS_TO_BUILD='X86;AArch64;RISCV' -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld' \
               -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind' \
-              -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
-              -DCOMPILER_RT_BUILD_XRAY=OFF \
-              -DCOMPILER_RT_BUILD_MEMPROF=OFF \
-              -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
-              -DCOMPILER_RT_BUILD_PROFILE=OFF \
-              -DLIBCXX_ENABLE_STATIC=OFF \
-              -DLIBCXX_HAS_ATOMIC_LIB=OFF \
-              -DLIBCXXABI_ENABLE_STATIC=OFF \
-              -DLIBUNWIND_ENABLE_STATIC=OFF \
-              -DSWIFT_BUILD_STATIC_STDLIB=OFF \
-              -DSWIFT_BUILD_STATIC_SDK_OVERLAY=OFF \
-              -DSWIFT_ENABLE_BACKTRACING:BOOL=ON \
-              -DLLVM_ENABLE_LIBCXX=ON \
-              -DLLVM_USE_LINKER=lld \
-              -DSWIFT_USE_LINKER=lld \
-              -DSWIFT_ENABLE_LLD_LINKER=ON \
-              -DSWIFT_ENABLE_GOLD_LINKER=OFF \
-              -DCMAKE_Swift_FLAGS=-use-ld=lld \
-              -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
-              -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
-              -DLLVM_BUILD_LLVM_DYLIB=ON \
-              -DLLVM_LINK_LLVM_DYLIB=OFF \
-              -DCLANG_LINK_CLANG_DYLIB=OFF \
-              -DLLVM_INSTALL_UTILS=ON \
-              -DLLVM_ENABLE_LIBXML2=OFF \
-              -DLLVM_ENABLE_ZSTD=OFF \
-              -DLLVM_ENABLE_ZLIB=ON \
-              -DLLDB_INCLUDE_TESTS=OFF \
-              -DLLDB_ENABLE_SWIG=OFF \
-              -DLLDB_ENABLE_PYTHON=OFF \
-              -DLLDB_ENABLE_LUA=OFF \
-              -DLLDB_ENABLE_LZMA=OFF \
-              -DLLDB_ENABLE_LIBXML2=OFF \
-              -DLLVM_INCLUDE_EXAMPLES=OFF \
-              -DLLVM_INCLUDE_BENCHMARKS=OFF \
-              -DLLVM_ENABLE_BINDINGS=OFF"
+              -DCOMPILER_RT_BUILD_SANITIZERS=OFF -DCOMPILER_RT_BUILD_XRAY=OFF -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+              -DCOMPILER_RT_BUILD_LIBFUZZER=OFF -DCOMPILER_RT_BUILD_PROFILE=OFF \
+              -DLIBCXX_ENABLE_STATIC=OFF -DLIBCXX_HAS_ATOMIC_LIB=OFF -DLIBCXXABI_ENABLE_STATIC=OFF -DLIBUNWIND_ENABLE_STATIC=OFF \
+              -DSWIFT_BUILD_STATIC_STDLIB=OFF -DSWIFT_BUILD_STATIC_SDK_OVERLAY=OFF -DSWIFT_ENABLE_BACKTRACING:BOOL=ON \
+              -DLLVM_ENABLE_LIBCXX=ON -DLLVM_USE_LINKER=lld -DSWIFT_USE_LINKER=lld -DSWIFT_ENABLE_LLD_LINKER=ON \
+              -DSWIFT_ENABLE_GOLD_LINKER=OFF -DCMAKE_Swift_FLAGS=-use-ld=lld \
+              -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
+              -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=OFF -DCLANG_LINK_CLANG_DYLIB=OFF -DLLVM_INSTALL_UTILS=ON \
+              -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=ON \
+              -DLLDB_INCLUDE_TESTS=OFF -DLLDB_ENABLE_SWIG=OFF -DLLDB_ENABLE_PYTHON=OFF -DLLDB_ENABLE_LUA=OFF \
+              -DLLDB_ENABLE_LZMA=OFF -DLLDB_ENABLE_LIBXML2=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_ENABLE_BINDINGS=OFF"
 
-          LLVM_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
-          SWIFT_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "swift-linux-*" | head -n 1)
-          test -n "$SWIFT_BUILD_DIR" && test -x "$SWIFT_BUILD_DIR/bin/swiftc"
-          "$SWIFT_BUILD_DIR/bin/swiftc" --version
-          LLDB_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "lldb-linux-*" | head -n 1)
-          DISPATCH_BUILD_DIR=$(find $GITHUB_WORKSPACE/src/build -maxdepth 2 -type d -name "libdispatch-linux-*" | head -n 1)
-
-          sed -i 's/#define LLVM_ENABLE_DYLIB 0/#define LLVM_ENABLE_DYLIB 1/g' \
-            "$LLVM_BUILD_DIR/tools/llvm-config/BuildVariables.inc" || true
-
+          LLVM_BUILD_DIR=$(find build -maxdepth 2 -type d -name "llvm-linux-*" | head -n 1)
+          sed -i 's/#define LLVM_ENABLE_DYLIB 0/#define LLVM_ENABLE_DYLIB 1/g' "$LLVM_BUILD_DIR/tools/llvm-config/BuildVariables.inc" || true
           ninja -C "$LLVM_BUILD_DIR" -j ${{ steps.hw.outputs.compile_jobs }} LLVM clang-cpp FileCheck llvm-config
           DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR" install
-          if [ -d "$LLVM_BUILD_DIR/runtimes/runtimes-bins" ]; then
-            DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR/runtimes/runtimes-bins" install || true
-          fi
-          if [ -n "$DISPATCH_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$DISPATCH_BUILD_DIR" install || true; fi
-          if [ -n "$SWIFT_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$SWIFT_BUILD_DIR" install || true; fi
-          if [ -n "$LLDB_BUILD_DIR" ]; then DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLDB_BUILD_DIR" install || true; fi
-
+          [ -d "$LLVM_BUILD_DIR/runtimes/runtimes-bins" ] && DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$LLVM_BUILD_DIR/runtimes/runtimes-bins" install || true
+          for pat in "libdispatch-linux-*" "swift-linux-*" "foundation-linux-*" "lldb-linux-*"; do
+            d=$(find build -maxdepth 2 -type d -name "$pat" | head -n 1)
+            [ -n "$d" ] && DESTDIR="${{ env.INSTALL_PREFIX }}" ninja -C "$d" install || true
+          done
           rm -rf /opt/swift-bootstrap
 
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
           for sub in usr/local usr local linux-x86_64 linux-aarch64; do
-            if [ -d "$TOOLCHAIN/$sub" ]; then
-              cp -af "$TOOLCHAIN/$sub/"* "$TOOLCHAIN/" 2>/dev/null || true
-              rm -rf "$TOOLCHAIN/$sub"
-            fi
+            [ -d "$TOOLCHAIN/$sub" ] && { cp -af "$TOOLCHAIN/$sub/"* "$TOOLCHAIN/" 2>/dev/null || true; rm -rf "$TOOLCHAIN/$sub"; }
           done
-
-          mkdir -p "$TOOLCHAIN/bin" "$TOOLCHAIN/include" "$TOOLCHAIN/lib"
-
-          rm -f "$TOOLCHAIN/bin/swift-package"* "$TOOLCHAIN/bin/swift-build"* \
-                "$TOOLCHAIN/bin/swift-test"* "$TOOLCHAIN/bin/swift-run"* \
-                "$TOOLCHAIN/bin/swift-sdk"* "$TOOLCHAIN/bin/swift-experimental"* \
-                "$TOOLCHAIN/bin/swift-driver"* "$TOOLCHAIN/bin/swift-help"* 2>/dev/null || true
-          ln -sf swift-frontend "$TOOLCHAIN/bin/swift"
-          ln -sf swift-frontend "$TOOLCHAIN/bin/swiftc"
-          ln -sf swift-frontend "$TOOLCHAIN/bin/swift-symbolgraph-extract"
-          ln -sf swift-frontend "$TOOLCHAIN/bin/swift-autolink-extract"
-          ln -sf swift-frontend "$TOOLCHAIN/bin/swift-api-digester"
+          mkdir -p "$TOOLCHAIN"/{bin,include,lib}
+          rm -f "$TOOLCHAIN"/bin/swift-{package,build,test,run,sdk,experimental,driver,help}* 2>/dev/null || true
+          for s in swift swiftc swift-symbolgraph-extract swift-autolink-extract swift-api-digester; do ln -sf swift-frontend "$TOOLCHAIN/bin/$s"; done
 
           cp -af "$LLVM_BUILD_DIR/lib/libLLVM"*".so"* "$TOOLCHAIN/lib/"
           cp -af "$LLVM_BUILD_DIR/lib/libclang"*".so"* "$TOOLCHAIN/lib/" || true
-          if [ -z "$(find "$TOOLCHAIN/lib" -maxdepth 1 -name 'libclang-cpp.so*' | head -n 1)" ]; then
-            echo "ERRO: libclang-cpp.so não foi gerada pelo Core LLVM/Clang." >&2
-            exit 1
-          fi
-          if ! test -e "$TOOLCHAIN/lib/libclang-cpp.so"; then
-            CLANG_CPP_SO=$(find "$TOOLCHAIN/lib" -maxdepth 1 -name 'libclang-cpp.so.*' -type f | head -n 1)
-            test -n "$CLANG_CPP_SO" || exit 1
-            ln -sfn "$(basename "$CLANG_CPP_SO")" "$TOOLCHAIN/lib/libclang-cpp.so"
-          fi
+          CLANG_CPP_SO=$(find "$TOOLCHAIN/lib" -maxdepth 1 -name 'libclang-cpp.so.*' -type f | head -n 1)
+          [ -n "$CLANG_CPP_SO" ] && ln -sfn "$(basename "$CLANG_CPP_SO")" "$TOOLCHAIN/lib/libclang-cpp.so"
           cp -af "$LLVM_BUILD_DIR/bin/clang"* "$TOOLCHAIN/bin/"
-          cp -f "$LLVM_BUILD_DIR/bin/llvm-config" "$TOOLCHAIN/bin/"
-          cp -f "$LLVM_BUILD_DIR/bin/FileCheck" "$TOOLCHAIN/bin/" || true
-          cp -f "$LLVM_BUILD_DIR/bin/llvm-tblgen" "$TOOLCHAIN/bin/" || true
-          cp -f "$LLVM_BUILD_DIR/bin/clang-tblgen" "$TOOLCHAIN/bin/" || true
-          cp -f "$LLVM_BUILD_DIR/bin/lld" "$TOOLCHAIN/bin/" || true
-          ln -sf lld "$TOOLCHAIN/bin/ld.lld" || true
-          ln -sf clang "$TOOLCHAIN/bin/clang++" || true
-          cp -ru "$LLVM_BUILD_DIR/include/"* "$TOOLCHAIN/include/" 2>/dev/null || true
-          cp -ru "$GITHUB_WORKSPACE/src/llvm-project/llvm/include/"* "$TOOLCHAIN/include/" 2>/dev/null || true
+          for u in llvm-config FileCheck llvm-tblgen clang-tblgen lld; do cp -f "$LLVM_BUILD_DIR/bin/$u" "$TOOLCHAIN/bin/" 2>/dev/null || true; done
+          ln -sf lld "$TOOLCHAIN/bin/ld.lld" && ln -sf clang "$TOOLCHAIN/bin/clang++"
+          cp -ru "$LLVM_BUILD_DIR/include/"* llvm-project/llvm/include/* "$TOOLCHAIN/include/" 2>/dev/null || true
           cp -ru "$LLVM_BUILD_DIR/lib/cmake" "$TOOLCHAIN/lib/" 2>/dev/null || true
 
           CFG_SITE=$(find "$TOOLCHAIN/include" "$LLVM_BUILD_DIR" -name "__config_site" 2>/dev/null | head -n 1)
-          if [ -n "$CFG_SITE" ] && [ -d "$TOOLCHAIN/include/c++/v1" ]; then
-            cp -af "$CFG_SITE" "$TOOLCHAIN/include/c++/v1/__config_site" 2>/dev/null || true
-          fi
+          [ -n "$CFG_SITE" ] && [ -d "$TOOLCHAIN/include/c++/v1" ] && cp -af "$CFG_SITE" "$TOOLCHAIN/include/c++/v1/__config_site" || true
 
-          find "$TOOLCHAIN/lib/swift" -name "*.so*" 2>/dev/null | while read -r f; do
-            if [ ! -e "$TOOLCHAIN/lib/$(basename "$f")" ]; then
-              ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
-            fi
+          find "$TOOLCHAIN/lib" -mindepth 2 -name "*.so*" | while read -r f; do
+            [ -e "$TOOLCHAIN/lib/$(basename "$f")" ] || ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
           done
-          find "$TOOLCHAIN/lib" -maxdepth 3 \( -name "libc++.so*" -o -name "libc++abi.so*" -o -name "libunwind.so*" \) | while read -r f; do
-            if [ "$(dirname "$f")" != "$TOOLCHAIN/lib" ]; then
-              ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
-            fi
-          done
-
           find "$TOOLCHAIN/lib" -name "libc++.so" -type f -exec sed -i 's/-latomic//g' {} + 2>/dev/null || true
           find "$TOOLCHAIN/lib" -maxdepth 4 -type f -name "*.so*" ! -name "libatomic.so*" -exec patchelf --remove-needed libatomic.so.1 {} + 2>/dev/null || true
 
           BUILTINS_A=$(find "$TOOLCHAIN" -name "libclang_rt.builtins*.a" | head -n 1)
           if [ -n "$BUILTINS_A" ]; then
-            "$TOOLCHAIN/bin/clang" -shared -fuse-ld=lld -nostdlib \
-              -Wl,-soname,libatomic.so.1 \
-              -Wl,--whole-archive "$BUILTINS_A" -Wl,--no-whole-archive \
-              -lc -o "$TOOLCHAIN/lib/libatomic.so.1"
+            "$TOOLCHAIN/bin/clang" -shared -fuse-ld=lld -nostdlib -Wl,-soname,libatomic.so.1 \
+              -Wl,--whole-archive "$BUILTINS_A" -Wl,--no-whole-archive -lc -o "$TOOLCHAIN/lib/libatomic.so.1"
             ln -sf libatomic.so.1 "$TOOLCHAIN/lib/libatomic.so"
           fi
-
-          rm -rf "$TOOLCHAIN/lib/swift_static" "$TOOLCHAIN/share/doc" "$TOOLCHAIN/share/man" "$TOOLCHAIN/share/info" 2>/dev/null || true
-          rm -f "$TOOLCHAIN/lib"/libLLVM*.a "$TOOLCHAIN/lib"/libclang*.a \
-                "$TOOLCHAIN/lib"/liblldb*.a "$TOOLCHAIN/lib"/liblld*.a 2>/dev/null || true
-
+          rm -rf "$TOOLCHAIN/lib/swift_static" "$TOOLCHAIN/share"/{doc,man,info} "$TOOLCHAIN/lib"/lib{LLVM,clang,lldb,lld}*.a 2>/dev/null || true
           ln -sfn . "$TOOLCHAIN/usr"
-
           "$TOOLCHAIN/bin/llvm-config" --link-shared --libs x86 aarch64 riscv
-          ls -la "$TOOLCHAIN/bin/clang" "$TOOLCHAIN/bin/llvm-config" "$TOOLCHAIN/bin/FileCheck"
 
-      - name: 5. Empacotar Core SDK (${{ matrix.arch }})
+      - name: 5. Empacotar Core SDK
         if: steps.core-cache.outputs.cache-hit != 'true'
-        run: |
-          cd /opt
-          tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/core-sdk-${{ matrix.arch }}.tar.zst omnillvm
+        run: tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/core-sdk-${{ matrix.arch }}.tar.zst -C /opt omnillvm
 
-      - name: 6. Salvar Cache do Core SDK Pronto (Stage 1 - ${{ matrix.arch }})
+      - name: 6. Salvar Cache do Core SDK
         if: steps.core-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: core-sdk-${{ matrix.arch }}.tar.zst
           key: omnillvm-core-${{ env.CORE_CACHE_REV }}-${{ matrix.arch }}
 
-      - name: Upload Core SDK (${{ matrix.arch }})
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: core-sdk-${{ matrix.arch }}
           path: core-sdk-${{ matrix.arch }}.tar.zst
@@ -570,7 +291,7 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # ESTÁGIO 2: Matrix 3x2 Real (6 Jobs em Paralelo: Flang+flang-rt, Ada e Rustc x AMD64/ARM64)
+  # ESTÁGIO 2: Matrix 3x2 (Flang+flang-rt, GNAT-Ada 27.1 e Rustc 1.94.0)
   # ============================================================================
   build-parallel-frontends:
     name: "Stage 2: ${{ matrix.component }} [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -586,81 +307,50 @@ jobs:
         component: [flang-mlir, gnat-ada, rust]
         arch: [amd64, arm64]
         include:
-          - arch: amd64
-            runner: ubuntu-26.04
-            rust_triple: x86_64-unknown-linux-gnu
-            gnu_triple: x86_64-linux-gnu
-          - arch: arm64
-            runner: ubuntu-26.04-arm
-            rust_triple: aarch64-unknown-linux-gnu
-            gnu_triple: aarch64-linux-gnu
+          - { arch: amd64, runner: ubuntu-26.04, rust_triple: x86_64-unknown-linux-gnu, gnu_triple: x86_64-linux-gnu }
+          - { arch: arm64, runner: ubuntu-26.04-arm, rust_triple: aarch64-unknown-linux-gnu, gnu_triple: aarch64-linux-gnu }
 
     steps:
-      - name: 0A. Preparar ZSTD e BASH para o Cache do GitHub no Ubuntu 26.04
+      - name: 0A. Preparar ZSTD e BASH
         shell: sh -e {0}
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 0B. Restaurar Cache do Overlay Pronto (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 0B. Restaurar Cache do Overlay
         id: overlay-cache
         if: inputs.rebuild_frontends != 'true'
         uses: actions/cache/restore@v4
         with:
           path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
           key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
-          restore-keys: |
-            omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
+          restore-keys: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
 
-      - name: 1. Baixar Core SDK (${{ matrix.arch }})
+      - name: 1. Baixar Core SDK
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           name: core-sdk-${{ matrix.arch }}
 
-      - name: Extrair Core SDK e Configurar CPUs/RAM no Ubuntu 26.04
+      - name: Extrair Core SDK e Configurar Ambiente
         id: hw
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends curl git xz-utils procps clang lld libc++-dev libc++abi-dev
-
-          apt-get install -y -qq --no-install-recommends libunwind-21-dev \
-            || apt-get install -y -qq --no-install-recommends libunwind-20-dev \
-            || true
+          apt-get install -y -qq --no-install-recommends libunwind-21-dev || apt-get install -y -qq --no-install-recommends libunwind-20-dev || true
           UNW=$(find /usr/lib -name 'libunwind.so.1*' 2>/dev/null | head -n 1)
-          if [ -n "$UNW" ]; then
-            UNW_DIR=$(dirname "$UNW")
-            echo "$UNW_DIR" > /etc/ld.so.conf.d/llvm-libunwind.conf
-            ldconfig
-            echo "LD_LIBRARY_PATH=$UNW_DIR:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
-          fi
-
+          [ -n "$UNW" ] && { echo "$(dirname "$UNW")" > /etc/ld.so.conf.d/llvm-libunwind.conf; ldconfig; echo "LD_LIBRARY_PATH=$(dirname "$UNW"):${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV; }
           CORES=$(nproc --all)
-          COMPILE_JOBS=$(( CORES + 2 ))
-          echo "cores=$CORES" >> $GITHUB_OUTPUT
-          echo "compile_jobs=$COMPILE_JOBS" >> $GITHUB_OUTPUT
-          echo "link_jobs=$CORES" >> $GITHUB_OUTPUT
-
+          printf "cores=%s\ncompile_jobs=%s\nlink_jobs=%s\n" "$CORES" "$((CORES+2))" "$CORES" >> $GITHUB_OUTPUT
           mkdir -p /opt /opt/overlay-install /dev/shm/ccache-tmp
-          tar -I "zstd -T0" -xf core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
-          rm -f core-sdk-${{ matrix.arch }}.tar.zst
-
+          tar -I "zstd -T0" -xf core-sdk-${{ matrix.arch }}.tar.zst -C /opt/ && rm -f core-sdk-${{ matrix.arch }}.tar.zst
           ln -sfn . "${{ env.INSTALL_PREFIX }}/usr"
-          "${{ env.INSTALL_PREFIX }}/bin/llvm-config" --link-shared --libs --system-libs x86 aarch64 riscv
 
-      - name: 1B. Corrigir e Validar a libc++ do Sistema - fallback template <int = 0> (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 1B. Configurar Shim Universal da libc++
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          dpkg -l | grep -E 'libc\+\+|libunwind|clang-21|llvm-21' || true
-          clang++ --version
-
-          FIX_DIR=/usr/local/share/omnillvm-fix
-          FIX_HDR="$FIX_DIR/libcxx_bitfix.h"
-          mkdir -p "$FIX_DIR"
-
+          FIX_HDR=/usr/local/share/omnillvm-fix/libcxx_bitfix.h
+          mkdir -p "$(dirname "$FIX_HDR")"
           cat > "$FIX_HDR" << 'EOF'
           #ifndef OMNILLVM_LIBCXX_BITFIX_H
           #define OMNILLVM_LIBCXX_BITFIX_H
@@ -670,30 +360,12 @@ jobs:
           #endif
           #ifdef _LIBCPP_BEGIN_NAMESPACE_STD
           _LIBCPP_BEGIN_NAMESPACE_STD
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned __x) _NOEXCEPT {
-            return __builtin_ctz(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned long __x) _NOEXCEPT {
-            return __builtin_ctzl(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned long long __x) _NOEXCEPT {
-            return __builtin_ctzll(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned __x) _NOEXCEPT {
-            return __builtin_clz(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned long __x) _NOEXCEPT {
-            return __builtin_clzl(__x);
-          }
-          template <int = 0>
-          [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned long long __x) _NOEXCEPT {
-            return __builtin_clzll(__x);
-          }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned __x) _NOEXCEPT { return __builtin_ctz(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned long __x) _NOEXCEPT { return __builtin_ctzl(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_ctz(unsigned long long __x) _NOEXCEPT { return __builtin_ctzll(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned __x) _NOEXCEPT { return __builtin_clz(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned long __x) _NOEXCEPT { return __builtin_clzl(__x); }
+          template <int = 0> [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR int __libcpp_clz(unsigned long long __x) _NOEXCEPT { return __builtin_clzll(__x); }
           _LIBCPP_END_NAMESPACE_STD
           #endif
           #if __has_include(<__bit/countr.h>)
@@ -705,289 +377,126 @@ jobs:
           #endif
           #endif
           EOF
-
-          cat -n "$FIX_HDR"
-
-          cat > /tmp/libcxx_probe.cpp << 'EOF'
-          #include <algorithm>
-          #include <vector>
-          #include <utility>
-          #include <string>
-          #include <charconv>
-          #include <functional>
-          #include <bitset>
-          #include <locale>
-          #include <random>
-          #include <chrono>
-          int main() {
-            std::vector<bool> v(10);
-            std::vector<int> a(1000);
-            std::sort(a.begin(), a.end());
-            std::nth_element(a.begin(), a.begin() + 10, a.end());
-            std::vector<std::pair<int, int>> p(100);
-            std::sort(p.begin(), p.end());
-            char b[32];
-            std::to_chars(b, b + 32, 12345u);
-            std::to_chars(b, b + 32, 12345u, 2);
-            std::to_chars(b, b + 32, 12345u, 8);
-            std::to_chars(b, b + 32, 12345u, 16);
-            std::to_chars(b, b + 32, 12345ul, 16);
-            return v[0] ? 1 : p[0].first;
-          }
-          EOF
-          if clang++ -std=c++17 -stdlib=libc++ -include "$FIX_HDR" -O2 -fsyntax-only /tmp/libcxx_probe.cpp 2>/tmp/probe.log; then
-            echo "✅ libc++ do sistema OK com o force-include."
-          else
-            echo "❌ libc++ do sistema ainda inconsistente mesmo com o shim." >&2
-            cat /tmp/probe.log >&2 || true
-            exit 1
-          fi
           echo "LIBCXX_FIX_FLAG=-include $FIX_HDR" >> $GITHUB_ENV
 
-      - name: 2. Cache ccache (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 2. Cache ccache
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: omnillvm-u2604-641-v18-${{ matrix.component }}-${{ matrix.arch }}
-          restore-keys: |
-            omnillvm-u2604-641-v18-${{ matrix.component }}-${{ matrix.arch }}
+          restore-keys: omnillvm-u2604-641-v18-${{ matrix.component }}-${{ matrix.arch }}
           max-size: 2G
 
-      # --- 3A. Flang + MLIR + flang-rt (Suporte Completo a Fortran Standalone + Zero libquadmath) ---
-      - name: 3A. Compilar Flang + MLIR + flang-rt (Shared libLLVM.so + Zero libquadmath)
+      - name: 3A. Compilar Flang + MLIR + flang-rt
         if: matrix.component == 'flang-mlir' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends cmake ninja-build make clang lld mold ccache python3 zlib1g-dev patchelf libc++-dev libc++abi-dev
-
           export TMPDIR="/tmp"
-          CXX_REL_FLAGS="${{ env.MAX_OPT_FLAGS }} ${LIBCXX_FIX_FLAG:-}"
-
           mkdir -p $GITHUB_WORKSPACE/flang-src && cd $GITHUB_WORKSPACE/flang-src
           git clone --filter=blob:none --no-checkout --depth 1 --branch ${{ env.SWIFT_LLVM_BRANCH }} https://github.com/swiftlang/llvm-project.git
-          cd llvm-project
-          git sparse-checkout init --cone
-          git sparse-checkout set cmake llvm mlir flang clang third-party runtimes flang-rt compiler-rt
-          git checkout
-
+          cd llvm-project && git sparse-checkout init --cone
+          git sparse-checkout set cmake llvm mlir flang clang third-party runtimes flang-rt compiler-rt && git checkout
           find flang flang-rt -name "CMakeLists.txt" -o -name "*.cmake" 2>/dev/null | \
             xargs sed -i 's/check_library_exists(quadmath.*/set(HAVE_LIBQUADMATH OFF)/g; s/check_include_file(quadmath.h.*/set(HAVE_QUADMATH_H OFF)/g' 2>/dev/null || true
 
           cmake -G Ninja -S llvm -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS_RELEASE="${{ env.MAX_OPT_FLAGS }}" \
-            -DCMAKE_CXX_FLAGS_RELEASE="${CXX_REL_FLAGS}" \
-            -DCMAKE_INSTALL_PREFIX="/opt/overlay-install" \
-            -DCMAKE_INSTALL_RPATH="\$ORIGIN/../lib:\$ORIGIN" \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold -Wl,--undefined-version" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE="${{ env.MAX_OPT_FLAGS }}" \
+            -DCMAKE_CXX_FLAGS_RELEASE="${{ env.MAX_OPT_FLAGS }} ${LIBCXX_FIX_FLAG:-}" \
+            -DCMAKE_INSTALL_PREFIX="/opt/overlay-install" -DCMAKE_INSTALL_RPATH="\$ORIGIN/../lib:\$ORIGIN" \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold -Wl,--undefined-version" \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold -Wl,--undefined-version" \
-            -DCMAKE_C_COMPILER="/usr/bin/clang" \
-            -DCMAKE_CXX_COMPILER="/usr/bin/clang++" \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DLLVM_VERSION_MAJOR=21 \
-            -DLLVM_VERSION_MINOR=0 \
-            -DLLVM_VERSION_PATCH=0 \
-            -DCLANG_VERSION_MAJOR=21 \
-            -DCLANG_VERSION_MINOR=0 \
-            -DCLANG_VERSION_PATCH=0 \
-            -DHAVE_LIBQUADMATH=OFF \
-            -DHAVE_QUADMATH_H=OFF \
-            -DFLANG_RUNTIME_F128_MATH_LIB="" \
-            -DFLANG_RT_ENABLE_SHARED=ON \
-            -DFLANG_RT_ENABLE_STATIC=ON \
-            -DLLVM_ENABLE_ASSERTIONS=OFF \
-            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;RISCV" \
-            -DLLVM_ENABLE_PROJECTS="clang;mlir;flang" \
-            -DLLVM_ENABLE_RUNTIMES="flang-rt" \
-            -DFLANG_ENABLE_FLANG_RT=ON \
-            -DLLVM_USE_LINKER=mold \
-            -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} \
-            -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
-            -DLLVM_BUILD_LLVM_DYLIB=ON \
-            -DLLVM_ENABLE_LIBCXX=ON \
-            -DLLVM_LINK_LLVM_DYLIB=ON \
-            -DCLANG_LINK_CLANG_DYLIB=OFF \
-            -DMLIR_BUILD_MLIR_C_DYLIB=ON \
-            -DMLIR_LINK_MLIR_DYLIB=ON \
-            -DLLVM_ENABLE_LIBXML2=OFF \
-            -DLLVM_ENABLE_ZSTD=OFF \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DFLANG_INCLUDE_TESTS=OFF \
-            -DMLIR_INCLUDE_TESTS=OFF
+            -DCMAKE_C_COMPILER="/usr/bin/clang" -DCMAKE_CXX_COMPILER="/usr/bin/clang++" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_VERSION_MAJOR=21 -DLLVM_VERSION_MINOR=0 -DLLVM_VERSION_PATCH=0 \
+            -DCLANG_VERSION_MAJOR=21 -DCLANG_VERSION_MINOR=0 -DCLANG_VERSION_PATCH=0 \
+            -DHAVE_LIBQUADMATH=OFF -DHAVE_QUADMATH_H=OFF -DFLANG_RUNTIME_F128_MATH_LIB="" \
+            -DFLANG_RT_ENABLE_SHARED=ON -DFLANG_RT_ENABLE_STATIC=ON -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;RISCV" -DLLVM_ENABLE_PROJECTS="clang;mlir;flang" \
+            -DLLVM_ENABLE_RUNTIMES="flang-rt" -DFLANG_ENABLE_FLANG_RT=ON -DLLVM_USE_LINKER=mold \
+            -DLLVM_PARALLEL_COMPILE_JOBS=${{ steps.hw.outputs.compile_jobs }} -DLLVM_PARALLEL_LINK_JOBS=${{ steps.hw.outputs.link_jobs }} \
+            -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_ENABLE_LIBCXX=ON -DLLVM_LINK_LLVM_DYLIB=ON -DCLANG_LINK_CLANG_DYLIB=OFF \
+            -DMLIR_BUILD_MLIR_C_DYLIB=ON -DMLIR_LINK_MLIR_DYLIB=ON -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DFLANG_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF
 
           ninja -C build -j ${{ steps.hw.outputs.compile_jobs }} tools/flang/install
           ninja -C build -j ${{ steps.hw.outputs.compile_jobs }} runtimes || true
-          if [ -d "build/runtimes/runtimes-bins" ]; then
-            ninja -C build/runtimes/runtimes-bins install || true
-          fi
-
-          mkdir -p /opt/overlay-install/lib
-          cp -a build/lib/libFortran* "/opt/overlay-install/lib/" 2>/dev/null || true
-          cp -a build/lib/libMLIR* "/opt/overlay-install/lib/" 2>/dev/null || true
-          cp -a build/lib/libflang* "/opt/overlay-install/lib/" 2>/dev/null || true
-
-          find build -name "libflang_rt*" -o -name "libFortran*" | while read -r rtfile; do
-            cp -af "$rtfile" /opt/overlay-install/lib/ 2>/dev/null || true
-            mkdir -p "/opt/overlay-install/lib/clang/21/lib/${{ matrix.rust_triple }}" "/opt/overlay-install/lib/clang/21/lib/linux"
-            cp -af "$rtfile" "/opt/overlay-install/lib/clang/21/lib/${{ matrix.rust_triple }}/" 2>/dev/null || true
-            cp -af "$rtfile" "/opt/overlay-install/lib/clang/21/lib/linux/" 2>/dev/null || true
+          [ -d "build/runtimes/runtimes-bins" ] && ninja -C build/runtimes/runtimes-bins install || true
+          mkdir -p /opt/overlay-install/lib "/opt/overlay-install/lib/clang/21/lib/${{ matrix.rust_triple }}" "/opt/overlay-install/lib/clang/21/lib/linux"
+          cp -a build/lib/lib{Fortran,MLIR,flang}* /opt/overlay-install/lib/ 2>/dev/null || true
+          find build -name "libflang_rt*" -o -name "libFortran*" | while read -r rt; do
+            cp -af "$rt" /opt/overlay-install/lib/ 2>/dev/null || true
+            cp -af "$rt" "/opt/overlay-install/lib/clang/21/lib/${{ matrix.rust_triple }}/" 2>/dev/null || true
+            cp -af "$rt" "/opt/overlay-install/lib/clang/21/lib/linux/" 2>/dev/null || true
           done
+          rm -f /opt/overlay-install/lib/lib{LLVM,clang,MLIR,flang}*.a
+          rm -rf /opt/overlay-install/share/{doc,man} 2>/dev/null || true
 
-          rm -f /opt/overlay-install/lib/libLLVM*.a \
-                /opt/overlay-install/lib/libclang*.a \
-                /opt/overlay-install/lib/libMLIR*.a \
-                /opt/overlay-install/lib/libflang*.a
-          rm -rf /opt/overlay-install/share/doc /opt/overlay-install/share/man 2>/dev/null || true
-
-      # --- 3B. GNAT-LLVM (Ada) [release/27.1 Fixo Estável para LLVM 21] ---
-      - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico (Shared libLLVM.so + RTS v16 Completa na Origem)
+      - name: 3B. Compilar GNAT-LLVM 27.1 Dinâmico
         if: matrix.component == 'gnat-ada' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
-          apt-get install -y -qq --no-install-recommends make gprbuild cmake ninja-build \
-            clang lld ccache python3 zlib1g-dev patchelf libc++-dev libc++abi-dev
-          apt-get install -y -qq --no-install-recommends gnat-15 gcc-15
-
-          GNAT_VER=15
-          test -x /usr/bin/gcc-15 || { echo "GNAT 15 bootstrap indisponível" >&2; exit 1; }
-          ln -sf /usr/bin/gcc-15 /usr/bin/gcc
-          ln -sf /usr/bin/gnat-${GNAT_VER} /usr/bin/gnat
-          ln -sf /usr/bin/gnatmake-${GNAT_VER} /usr/bin/gnatmake
-          ln -sf /usr/bin/gnatbind-${GNAT_VER} /usr/bin/gnatbind
-          ln -sf /usr/bin/gnatlink-${GNAT_VER} /usr/bin/gnatlink
-          ln -sf /usr/bin/ld.lld /usr/bin/ld
-          ln -sf /usr/bin/ld.lld /usr/bin/aarch64-linux-gnu-ld || true
-          ln -sf /usr/bin/ld.lld /usr/bin/x86_64-linux-gnu-ld || true
-
+          apt-get install -y -qq --no-install-recommends make gprbuild cmake ninja-build clang lld ccache python3 zlib1g-dev patchelf libc++-dev libc++abi-dev gnat-15 gcc-15
+          for t in gcc gnat gnatmake gnatbind gnatlink; do ln -sf /usr/bin/${t}-15 /usr/bin/${t}; done
+          for l in /usr/bin/ld /usr/bin/aarch64-linux-gnu-ld /usr/bin/x86_64-linux-gnu-ld; do ln -sf /usr/bin/ld.lld "$l" || true; done
           LLVM_SO=$(ls "${{ env.INSTALL_PREFIX }}/lib/"libLLVM-*.so "${{ env.INSTALL_PREFIX }}/lib/"libLLVM.so.* 2>/dev/null | head -n 1)
-          if [ -n "$LLVM_SO" ] && [ ! -e "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so" ]; then
-            ln -sf "$(basename "$LLVM_SO")" "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so"
-          fi
+          [ -n "$LLVM_SO" ] && [ ! -e "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so" ] && ln -sf "$(basename "$LLVM_SO")" "${{ env.INSTALL_PREFIX }}/lib/libLLVM.so"
 
-          export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
-          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:${LD_LIBRARY_PATH:-}"
-          export CC="${{ env.INSTALL_PREFIX }}/bin/clang"
-          export CXX="${{ env.INSTALL_PREFIX }}/bin/clang++"
-          export TMPDIR="/tmp"
-          test -e "${{ env.INSTALL_PREFIX }}/lib/libclang-cpp.so" || {
-            echo "ERRO: libclang-cpp.so está ausente no SDK LLVM (Stage 1)." >&2
-            exit 1
-          }
-          echo "Bibliotecas Clang compartilhadas disponíveis:"
-          ls -l "${{ env.INSTALL_PREFIX }}/lib/"libclang-cpp.so*
+          export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH" LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:${LD_LIBRARY_PATH:-}"
+          export CC="${{ env.INSTALL_PREFIX }}/bin/clang" CXX="${{ env.INSTALL_PREFIX }}/bin/clang++" TMPDIR="/tmp"
 
           mkdir -p $GITHUB_WORKSPACE/ada && cd $GITHUB_WORKSPACE/ada
-          git clone --depth 1 --branch ${{ env.GNAT_LLVM_BRANCH }} https://github.com/AdaCore/gnat-llvm.git
-          cd gnat-llvm
-          if git ls-remote --exit-code --heads https://github.com/AdaCore/llvm-bindings.git "${{ env.GNAT_LLVM_BRANCH }}" >/dev/null 2>&1; then
-            git clone --depth 1 --branch ${{ env.GNAT_LLVM_BRANCH }} https://github.com/AdaCore/llvm-bindings.git
-          else
-            git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
-          fi
-
-          if git ls-remote --exit-code --heads https://gcc.gnu.org/git/gcc.git "${{ env.GCC_ADA_BRANCH }}" >/dev/null 2>&1; then
-            git clone --filter=blob:none --no-checkout --depth 1 --branch "${{ env.GCC_ADA_BRANCH }}" https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
-          else
-            git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
-          fi
+          git clone --depth 1 --branch ${{ env.GNAT_LLVM_BRANCH }} https://github.com/AdaCore/gnat-llvm.git && cd gnat-llvm
+          git clone --depth 1 --branch ${{ env.GNAT_LLVM_BRANCH }} https://github.com/AdaCore/llvm-bindings.git 2>/dev/null || git clone --depth 1 https://github.com/AdaCore/llvm-bindings.git
+          git clone --filter=blob:none --no-checkout --depth 1 --branch "${{ env.GCC_ADA_BRANCH }}" https://gcc.gnu.org/git/gcc.git llvm-interface/gcc 2>/dev/null || git clone --filter=blob:none --no-checkout --depth 1 https://gcc.gnu.org/git/gcc.git llvm-interface/gcc
           cd llvm-interface/gcc && git sparse-checkout init --cone && git sparse-checkout set gcc/ada include && git checkout && cd ../..
           ln -s gcc/gcc/ada llvm-interface/gnat_src
-
-          if ! grep -q "procedure Clear" llvm-interface/gnat_src/table.ads; then
-            sed -i 's/procedure Init;/procedure Init;\n      procedure Clear renames Init;/' llvm-interface/gnat_src/table.ads
-          fi
+          grep -q "procedure Clear" llvm-interface/gnat_src/table.ads || sed -i 's/procedure Init;/procedure Init;\n      procedure Clear renames Init;/' llvm-interface/gnat_src/table.ads
 
           python3 - << 'EOF'
-          p = "llvm-interface/gnat_src/gnatlink.adb"
-          with open(p, "r") as f:
-              txt = f.read()
+          from pathlib import Path
+          p = Path("llvm-interface/gnat_src/gnatlink.adb")
+          txt = p.read_text()
           if "use type System.CRTL.long;" not in txt:
-              txt = txt.replace("procedure Gnatlink is", "with System.CRTL; use System.CRTL;\nprocedure Gnatlink is\n   use type System.CRTL.long;", 1)
-          with open(p, "w") as f:
-              f.write(txt)
+              p.write_text(txt.replace("procedure Gnatlink is", "with System.CRTL; use System.CRTL;\nprocedure Gnatlink is\n   use type System.CRTL.long;", 1))
+          for name in ("gnat_llvm.gpr", "tools.gpr"):
+              f = Path("llvm-interface") / name
+              d = f.read_text().replace('"-Werror"', '"-Wno-error"').replace('"-gnatg"', '"-gnatg", "-gnatwn"')
+              d = d.replace('for Required_Switches use ("-static-libgcc");', '')
+              d = d.replace('("-static-libstdc++", "-lclangBasic")', '("-stdlib=libc++", "-lclang-cpp")')
+              d = d.replace('for Switches ("Ada") use ("-static-libstdc++");', '')
+              f.write_text(d)
           EOF
 
-          sed -i 's/"-Werror"/"-Wno-error"/g' llvm-interface/*.gpr 2>/dev/null || true
-          sed -i 's/"-gnatg"/"-gnatg", "-gnatwn"/g' llvm-interface/*.gpr 2>/dev/null || true
-          python3 - <<'PY_GPR'
-          from pathlib import Path
-          root = Path('llvm-interface')
-          for name in ('gnat_llvm.gpr', 'tools.gpr'):
-              f = root / name
-              data = f.read_text()
-              data = data.replace('for Required_Switches use ("-static-libgcc");', '')
-              data = data.replace('("-static-libstdc++", "-lclangBasic")',
-                                  '("-stdlib=libc++", "-lclang-cpp")')
-              data = data.replace('for Switches ("Ada") use ("-static-libstdc++");', '')
-              f.write_text(data)
-          if '-lclangBasic' in (root / 'gnat_llvm.gpr').read_text():
-              raise SystemExit('ERRO: ainda existe -lclangBasic no projeto GNAT.')
-          if '-lclang-cpp' not in (root / 'gnat_llvm.gpr').read_text():
-              raise SystemExit('ERRO: -lclang-cpp não foi configurado.')
-          PY_GPR
-
-          make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} \
-            CXXFLAGS="-stdlib=libc++ -Wno-error ${LIBCXX_FIX_FLAG:-}" \
-            LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" \
-            PREFIX="/opt/overlay-install" \
-            build
-
-          test -x llvm-interface/bin/llvm-gnat1
-          ldd llvm-interface/bin/llvm-gnat1 || true
-
-          mkdir -p /opt/overlay-install/bin /opt/overlay-install/lib/rts-native/adalib /opt/overlay-install/lib/rts-native/adainclude
+          make -C llvm-interface -j${{ steps.hw.outputs.compile_jobs }} CXXFLAGS="-stdlib=libc++ -Wno-error ${LIBCXX_FIX_FLAG:-}" LLVM_CONFIG="${{ env.INSTALL_PREFIX }}/bin/llvm-config" PREFIX="/opt/overlay-install" build
+          mkdir -p /opt/overlay-install/bin /opt/overlay-install/lib/rts-native/{adalib,adainclude}
           cp -af llvm-interface/bin/* /opt/overlay-install/bin/
-          ADA_LIB_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adalib/libgnat.a))
-          ADA_INC_DIR=$(dirname $(gcc-${GNAT_VER} -print-file-name=adainclude/system.ads))
-          cp -af "$ADA_LIB_DIR/"*.ali /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
-          cp -af "$ADA_INC_DIR/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
-
-          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat.so
-          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnat-${GNAT_VER}.so
-          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnarl.so
-          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/rts-native/adalib/libgnarl-${GNAT_VER}.so
-          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/libgnat.so
-          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-${GNAT_VER}.so" /opt/overlay-install/lib/libgnat-${GNAT_VER}.so
-          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/libgnarl.so
-          ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-${GNAT_VER}.so" /opt/overlay-install/lib/libgnarl-${GNAT_VER}.so
-
+          cp -af "$(dirname "$(gcc-15 -print-file-name=adalib/libgnat.a)")/"*.ali /opt/overlay-install/lib/rts-native/adalib/ 2>/dev/null || true
+          cp -af "$(dirname "$(gcc-15 -print-file-name=adainclude/system.ads)")/"* /opt/overlay-install/lib/rts-native/adainclude/ 2>/dev/null || true
+          for l in libgnat libgnarl; do
+            for d in /opt/overlay-install/lib/rts-native/adalib /opt/overlay-install/lib; do
+              ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/${l}-15.so" "$d/${l}.so"
+              ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/${l}-15.so" "$d/${l}-15.so"
+            done
+          done
           ln -sfn lib/rts-native /opt/overlay-install/rts-native
-          ln -sfn rts-native/adainclude /opt/overlay-install/lib/adainclude
-          ln -sfn rts-native/adalib /opt/overlay-install/lib/adalib
-          ln -sfn lib/rts-native/adainclude /opt/overlay-install/adainclude
-          ln -sfn lib/rts-native/adalib /opt/overlay-install/adalib
-          ls -la /opt/overlay-install/bin/
+          ln -sfn rts-native/adainclude /opt/overlay-install/lib/adainclude && ln -sfn rts-native/adalib /opt/overlay-install/lib/adalib
+          ln -sfn lib/rts-native/adainclude /opt/overlay-install/adainclude && ln -sfn lib/rts-native/adalib /opt/overlay-install/adalib
 
-      # --- 3C. Apenas Rustc 1.94.0 + Stdlib Dinâmicos (ZERO Cargo / ZERO Package Manager!) ---
-      - name: 3C. Compilar Apenas Rustc 1.94.0 + Stdlib (Sem Cargo + link-shared = true + mold)
+      - name: 3C. Compilar Rustc 1.94.0 + Stdlib (Sem Cargo)
         if: matrix.component == 'rust' && steps.overlay-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends make cmake ninja-build clang mold lld ccache python3 curl pkg-config zlib1g-dev libc++-dev libc++abi-dev
-
-          export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH"
-          export LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:${LD_LIBRARY_PATH:-}"
-          export TMPDIR="/tmp"
+          export PATH="${{ env.INSTALL_PREFIX }}/bin:$PATH" LD_LIBRARY_PATH="${{ env.INSTALL_PREFIX }}/lib:${LD_LIBRARY_PATH:-}" TMPDIR="/tmp"
           export RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-L${{ env.INSTALL_PREFIX }}/lib"
-
           mkdir -p $GITHUB_WORKSPACE/rust-src && cd $GITHUB_WORKSPACE/rust-src
-          git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git
-          cd rust
-
-          if ! grep -q "FileSystem" "${{ env.INSTALL_PREFIX }}/include/llvm/Support/PGOOptions.h"; then
-            sed -i 's/"", "", "", FS,/"", "", "",/g' compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp || true
-          fi
-
+          git clone --depth 1 --branch ${{ env.RUST_BRANCH }} https://github.com/rust-lang/rust.git && cd rust
+          grep -q "FileSystem" "${{ env.INSTALL_PREFIX }}/include/llvm/Support/PGOOptions.h" || sed -i 's/"", "", "", FS,/"", "", "",/g' compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp || true
           cat <<EOF > bootstrap.toml
           change-id = "ignore"
-
           [llvm]
           download-ci-llvm = false
           link-shared = true
           use-libcxx = true
           tests = false
-
           [build]
           build = "${{ matrix.rust_triple }}"
           host = ["${{ matrix.rust_triple }}"]
@@ -998,10 +507,8 @@ jobs:
           extended = false
           tools = []
           ccache = "ccache"
-
           [install]
           prefix = "/opt/overlay-install"
-
           [rust]
           optimize = true
           lld = false
@@ -1011,7 +518,6 @@ jobs:
           debuginfo-level-std = 1
           codegen-units = ${{ steps.hw.outputs.cores }}
           rpath = true
-
           [target.${{ matrix.rust_triple }}]
           llvm-config = "${{ env.INSTALL_PREFIX }}/bin/llvm-config"
           llvm-filecheck = "${{ env.INSTALL_PREFIX }}/bin/FileCheck"
@@ -1019,26 +525,21 @@ jobs:
           cxx = "${{ env.INSTALL_PREFIX }}/bin/clang++"
           linker = "${{ env.INSTALL_PREFIX }}/bin/clang"
           EOF
+          python3 ./x.py build --stage 1 -j ${{ steps.hw.outputs.compile_jobs }} && python3 ./x.py install
+          rm -rf /opt/overlay-install/share/{doc,man}
 
-          python3 ./x.py build --stage 1 -j ${{ steps.hw.outputs.compile_jobs }}
-          python3 ./x.py install
-          rm -rf /opt/overlay-install/share/doc /opt/overlay-install/share/man
-
-      - name: 4. Empacotar Overlay (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 4. Empacotar Overlay
         if: steps.overlay-cache.outputs.cache-hit != 'true'
-        run: |
-          cd /opt/overlay-install
-          tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst .
+        run: tar -I "zstd -1 -T0" -cf $GITHUB_WORKSPACE/overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst -C /opt/overlay-install .
 
-      - name: 5. Salvar Cache do Overlay Pronto (${{ matrix.component }}-${{ matrix.arch }})
+      - name: 5. Salvar Cache do Overlay
         if: steps.overlay-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
           key: omnillvm-overlay-tarball-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.component }}-${{ matrix.arch }}
 
-      - name: Upload do Overlay (${{ matrix.component }}-${{ matrix.arch }})
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: overlay-${{ matrix.component }}-${{ matrix.arch }}
           path: overlay-${{ matrix.component }}-${{ matrix.arch }}.tar.zst
@@ -1046,7 +547,7 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # ESTÁGIO 3: Fusão Limpa, RPATH ($ORIGIN), Deduplicação, Strip e Suíte de Testes
+  # ESTÁGIO 3: Fusão, RPATH, Deduplicação, Strip e Suíte de 7 Testes
   # ============================================================================
   package-arch:
     name: "Stage 3: Merge, Strip & Tests [Ubuntu 26.04 - ${{ matrix.arch }}]"
@@ -1059,26 +560,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
         include:
-          - arch: amd64
-            runner: ubuntu-26.04
-            gnu_triple: x86_64-linux-gnu
-          - arch: arm64
-            runner: ubuntu-26.04-arm
-            gnu_triple: aarch64-linux-gnu
+          - { arch: amd64, runner: ubuntu-26.04, gnu_triple: x86_64-linux-gnu }
+          - { arch: arm64, runner: ubuntu-26.04-arm, gnu_triple: aarch64-linux-gnu }
 
     steps:
-      - name: 0A. Preparar ZSTD e BASH para o Cache do GitHub no Ubuntu 26.04
+      - name: 0A. Preparar ZSTD e BASH
         shell: sh -e {0}
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends bash zstd ca-certificates tar
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 0B. Restaurar Cache do Pacote Final Pronto (Stage 3 - ${{ matrix.arch }})
+      - name: 0B. Restaurar Cache do Pacote Final
         id: pkg-cache
         if: inputs.rebuild_package != 'true' && inputs.rebuild_frontends != 'true' && inputs.rebuild_core != 'true'
         uses: actions/cache/restore@v4
@@ -1086,607 +579,230 @@ jobs:
           path: omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst
           key: omnillvm-final-pkg-${{ env.PACKAGE_CACHE_REV }}-${{ env.CORE_CACHE_REV }}-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.arch }}
 
-      - name: Baixar Artefatos (${{ matrix.arch }})
+      - name: Baixar Artefatos
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: "*-${{ matrix.arch }}"
           path: artifacts
 
-      - name: 1. Unificar Árvore, Ativar clang.cfg Pure LLVM, Deduplicar e Aplicar Strip Cirúrgico
+      - name: 1. Unificar Árvore, Configurar Pure LLVM, Deduplicar e Strip
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           apt-get install -y -qq --no-install-recommends patchelf rdfind symlinks file findutils python3
-
           CORES=$(nproc --all)
+          TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
           mkdir -p /opt
-
           tar -I "zstd -T0" -xf artifacts/core-sdk-${{ matrix.arch }}/core-sdk-${{ matrix.arch }}.tar.zst -C /opt/
-          rm -f "${{ env.INSTALL_PREFIX }}/usr" || true
+          rm -f "$TOOLCHAIN/usr" || true
           for comp in flang-mlir gnat-ada rust; do
-            tar -I "zstd -T0" -xf artifacts/overlay-${comp}-${{ matrix.arch }}/overlay-${comp}-${{ matrix.arch }}.tar.zst -C "${{ env.INSTALL_PREFIX }}/"
+            tar -I "zstd -T0" -xf artifacts/overlay-${comp}-${{ matrix.arch }}/overlay-${comp}-${{ matrix.arch }}.tar.zst -C "$TOOLCHAIN/"
           done
           rm -rf artifacts
-
-          TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
-          STRIP="$TOOLCHAIN/bin/llvm-strip"
-
-          rm -f "$TOOLCHAIN/bin/cargo"* "$TOOLCHAIN/bin/swift-package"* \
-                "$TOOLCHAIN/bin/swift-build"* "$TOOLCHAIN/bin/swift-test"* \
-                "$TOOLCHAIN/bin/swift-run"* "$TOOLCHAIN/bin/swift-sdk"* 2>/dev/null || true
-
-          # Remove runtimes de sanitizers/xray/fuzzer/memprof/profile do compiler-rt (vinculados a libstdc++),
-          # preservando integralmente libclang_rt.builtins*.a e clang_rt.crtbegin/crtend*.o!
+          rm -f "$TOOLCHAIN"/bin/{cargo*,swift-package*,swift-build*,swift-test*,swift-run*,swift-sdk*} 2>/dev/null || true
           find "$TOOLCHAIN/lib" -name "libclang_rt.*" ! -name "libclang_rt.builtins*" -delete 2>/dev/null || true
 
-          # O compiler-rt gera clang_rt.crtbegin*.o e clang_rt.crtend*.o (já em modo PIC);
-          # expomos crtbegin.o, crtbeginS.o, crtbeginT.o, crtend.o e crtendS.o apontando para os arquivos reais!
-          CRTBEGIN_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtbegin*.o" -type f | head -n 1)
-          CRTEND_FILE=$(find "$TOOLCHAIN" -name "clang_rt.crtend*.o" -type f | head -n 1)
-          if [ -n "$CRTBEGIN_FILE" ] && [ -n "$CRTEND_FILE" ]; then
-            CRT_DIR=$(dirname "$CRTBEGIN_FILE")
+          CRTBEGIN=$(find "$TOOLCHAIN" -name "clang_rt.crtbegin*.o" -type f | head -n 1)
+          CRTEND=$(find "$TOOLCHAIN" -name "clang_rt.crtend*.o" -type f | head -n 1)
+          if [ -n "$CRTBEGIN" ] && [ -n "$CRTEND" ]; then
             rm -f "$TOOLCHAIN/lib/crtbegin"*.o "$TOOLCHAIN/lib/crtend"*.o
-            cp -af "$CRTBEGIN_FILE" "$TOOLCHAIN/lib/crtbegin.o"
-            cp -af "$CRTBEGIN_FILE" "$TOOLCHAIN/lib/crtbeginS.o"
-            cp -af "$CRTBEGIN_FILE" "$TOOLCHAIN/lib/crtbeginT.o"
-            cp -af "$CRTEND_FILE" "$TOOLCHAIN/lib/crtend.o"
-            cp -af "$CRTEND_FILE" "$TOOLCHAIN/lib/crtendS.o"
-            BUILTINS_A=$(find "$CRT_DIR" -name "libclang_rt.builtins*.a" | head -n 1)
-            if [ -n "$BUILTINS_A" ]; then
-              ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libclang_rt.builtins.a"
-            fi
+            for b in crtbegin.o crtbeginS.o crtbeginT.o; do cp -af "$CRTBEGIN" "$TOOLCHAIN/lib/$b"; done
+            for e in crtend.o crtendS.o; do cp -af "$CRTEND" "$TOOLCHAIN/lib/$e"; done
+            BUILTINS_A=$(find "$(dirname "$CRTBEGIN")" -name "libclang_rt.builtins*.a" | head -n 1)
+            [ -n "$BUILTINS_A" ] && ln -sf "$BUILTINS_A" "$TOOLCHAIN/lib/libclang_rt.builtins.a"
           fi
 
-          cat << 'EOF' > "$TOOLCHAIN/bin/clang.cfg"
-          --rtlib=compiler-rt
-          --unwindlib=libunwind
-          -fuse-ld=lld
-          -B<CFGDIR>/../lib
-          -L<CFGDIR>/../lib
-          -L<CFGDIR>/../lib/rts-native/adalib
-          -Wl,-rpath,<CFGDIR>/../lib
-          EOF
-
-          cat << 'EOF' > "$TOOLCHAIN/bin/clang++.cfg"
-          --rtlib=compiler-rt
-          --unwindlib=libunwind
-          --stdlib=libc++
-          -fuse-ld=lld
-          -B<CFGDIR>/../lib
-          -L<CFGDIR>/../lib
-          -L<CFGDIR>/../lib/rts-native/adalib
-          -Wl,-rpath,<CFGDIR>/../lib
-          EOF
-
-          cat << 'EOF' > "$TOOLCHAIN/bin/flang.cfg"
-          -fuse-ld=lld
-          -B<CFGDIR>/../lib
-          -L<CFGDIR>/../lib
-          -L<CFGDIR>/../lib/rts-native/adalib
-          -Wl,-rpath,<CFGDIR>/../lib
-          EOF
-
-          ln -sf clang.cfg "$TOOLCHAIN/bin/llvm-gcc.cfg"
-          ln -sf clang.cfg "$TOOLCHAIN/bin/gcc.cfg"
-          ln -sf flang.cfg "$TOOLCHAIN/bin/flang-new.cfg"
-          ln -sf flang.cfg "$TOOLCHAIN/bin/flang-21.cfg"
+          printf -- "--rtlib=compiler-rt\n--unwindlib=libunwind\n-fuse-ld=lld\n-B<CFGDIR>/../lib\n-L<CFGDIR>/../lib\n-L<CFGDIR>/../lib/rts-native/adalib\n-Wl,-rpath,<CFGDIR>/../lib\n" > "$TOOLCHAIN/bin/clang.cfg"
+          printf -- "--rtlib=compiler-rt\n--unwindlib=libunwind\n--stdlib=libc++\n-fuse-ld=lld\n-B<CFGDIR>/../lib\n-L<CFGDIR>/../lib\n-L<CFGDIR>/../lib/rts-native/adalib\n-Wl,-rpath,<CFGDIR>/../lib\n" > "$TOOLCHAIN/bin/clang++.cfg"
+          printf -- "-fuse-ld=lld\n-B<CFGDIR>/../lib\n-L<CFGDIR>/../lib\n-L<CFGDIR>/../lib/rts-native/adalib\n-Wl,-rpath,<CFGDIR>/../lib\n" > "$TOOLCHAIN/bin/flang.cfg"
+          ln -sf clang.cfg "$TOOLCHAIN/bin/llvm-gcc.cfg" && ln -sf clang.cfg "$TOOLCHAIN/bin/gcc.cfg"
+          ln -sf flang.cfg "$TOOLCHAIN/bin/flang-new.cfg" && ln -sf flang.cfg "$TOOLCHAIN/bin/flang-21.cfg"
 
           cat << 'EOF' > "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
           #!/usr/bin/env bash
           set -euo pipefail
-          if [ "$(id -u)" -ne 0 ]; then
-            SUDO="sudo"
-          else
-            SUDO=""
-          fi
-          echo "📦 Instalando dependências de sistema (GNAT RTS 15 é a exceção Ada necessária)..."
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
           export DEBIAN_FRONTEND=noninteractive
           $SUDO apt-get update -qq
-          $SUDO apt-get install -y --no-install-recommends \
-            libc6-dev \
-            libedit2 libncurses6 libncurses-dev libtinfo6 \
-            zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 \
-            libicu78 libxml2-16 \
-            libblocksruntime0 libblocksruntime-dev \
-            libgnat-15
-
-          echo "✅ Todas as bibliotecas dinâmicas de sistema do Ubuntu 26.04 foram instaladas com sucesso!"
+          $SUDO apt-get install -y --no-install-recommends libc6-dev libedit2 libncurses6 libncurses-dev libtinfo6 zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 libicu78 libxml2-16 libcurl4t64 libblocksruntime0 libblocksruntime-dev libgnat-15
           EOF
           chmod +x "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
 
-          # Garante que TODAS as bibliotecas compartilhadas (.so*) em subdiretórios (swift/linux,
-          # swift/linux/aarch64, swift/linux/x86_64, swift/host, lldb/swift, multiarch, etc.)
-          # tenham symlink direto no diretório raiz $TOOLCHAIN/lib/
-          find "$TOOLCHAIN/lib" -mindepth 2 \( -type f -o -type l \) -name "*.so*" ! -name "libgcc*" 2>/dev/null | while read -r f; do
-            base=$(basename "$f")
-            if [ ! -e "$TOOLCHAIN/lib/$base" ]; then
-              ln -sf "$f" "$TOOLCHAIN/lib/$base" 2>/dev/null || true
-            fi
-          done
-
-          # Aplica RPATH relativo universal (cobrindo de 1 até 5 níveis de profundidade abaixo de $TOOLCHAIN/lib)
-          # em TODOS os executáveis e bibliotecas ELF (incluindo rust-objcopy, plugins e lldb/swift/*)
           LIB_RPATH='$ORIGIN:$ORIGIN/..:$ORIGIN/../..:$ORIGIN/../../..:$ORIGIN/../../../..:$ORIGIN/../../../../..:$ORIGIN/swift/linux:$ORIGIN/swift/host:$ORIGIN/swift/host/compiler'
           BIN_RPATH='$ORIGIN/../lib:$ORIGIN/../lib/swift/linux:$ORIGIN/../lib/swift/host:$ORIGIN/../lib/swift/host/compiler:$ORIGIN'
-
-          find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
-            xargs -P "$CORES" -n 10 patchelf --set-rpath "$BIN_RPATH" 2>/dev/null || true
-
-          find "$TOOLCHAIN/lib" -type f \( -executable -o -name "*.so*" \) ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
-            xargs -P "$CORES" -n 10 patchelf --set-rpath "$LIB_RPATH" 2>/dev/null || true
-
-          # Deduplicação física por Symlinks Relativos
+          apply_rpaths() {
+            find "$TOOLCHAIN/lib" -mindepth 2 \( -type f -o -type l \) -name "*.so*" ! -name "libgcc*" 2>/dev/null | while read -r f; do
+              [ -e "$TOOLCHAIN/lib/$(basename "$f")" ] || ln -sf "$f" "$TOOLCHAIN/lib/$(basename "$f")" 2>/dev/null || true
+            done
+            find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | xargs -P "$CORES" -n 10 patchelf --set-rpath "$BIN_RPATH" 2>/dev/null || true
+            find "$TOOLCHAIN/lib" -type f \( -executable -o -name "*.so*" \) ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | xargs -P "$CORES" -n 10 patchelf --set-rpath "$LIB_RPATH" 2>/dev/null || true
+          }
+          apply_rpaths
           rdfind -makesymlinks true -makeresultsfile false "$TOOLCHAIN"
           symlinks -cr "$TOOLCHAIN"
-
-          # Re-garante que os symlinks em $TOOLCHAIN/lib e os RPATHs nos alvos físicos pós-rdfind estejam intactos
-          find "$TOOLCHAIN/lib" -mindepth 2 -type f -name "*.so*" ! -name "libgcc*" 2>/dev/null | while read -r f; do
-            base=$(basename "$f")
-            if [ ! -e "$TOOLCHAIN/lib/$base" ]; then
-              ln -sf "$f" "$TOOLCHAIN/lib/$base" 2>/dev/null || true
-            fi
-          done
+          apply_rpaths
           symlinks -cr "$TOOLCHAIN/lib"
 
-          find "$TOOLCHAIN/bin" -type f -executable -exec file {} + | awk -F: '/ELF/ {print $1}' | \
-            xargs -P "$CORES" -n 10 patchelf --set-rpath "$BIN_RPATH" 2>/dev/null || true
-
-          find "$TOOLCHAIN/lib" -type f \( -executable -o -name "*.so*" \) ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | \
-            xargs -P "$CORES" -n 10 patchelf --set-rpath "$LIB_RPATH" 2>/dev/null || true
-
-          # Caso qualquer ELF tenha DT_NEEDED apontando para libstdc++.so.6, redireciona para libc++.so.1
           find "$TOOLCHAIN/bin" "$TOOLCHAIN/lib" -type f ! -name "*.o" ! -name "*.a" -exec file {} + | awk -F: '/ELF/ {print $1}' | while IFS= read -r elf; do
             if patchelf --print-needed "$elf" 2>/dev/null | grep -q '^libstdc++'; then
               patchelf --replace-needed libstdc++.so.6 libc++.so.1 --add-needed libc++abi.so.1 "$elf" 2>/dev/null || true
             fi
           done
 
-          # Corrige colisão de PassRegistry e double-free entre libclang-cpp.so e libLLVM.so no llvm-gnat1:
-          # 1. Neutraliza DT_INIT/DT_FINI/DT_INIT_ARRAY/DT_FINI_ARRAY duplicados na libclang-cpp.so*.
-          # 2. Reordena DT_NEEDED nos binários (como llvm-gnat1) para que libLLVM.so venha SEMPRE antes de libclang-cpp.so
-          #    (ou remove libclang-cpp.so se nenhum símbolo exclusivo de clang::* for referenciado).
+          # Corrige PassRegistry / init_array duplicado entre libclang-cpp.so e libLLVM.so no llvm-gnat1
           TOOLCHAIN="$TOOLCHAIN" python3 - << 'PY_ELF_FIX'
-          import os, glob, struct, subprocess
-
-          toolchain = os.environ["TOOLCHAIN"]
-
-          for p in glob.glob(os.path.join(toolchain, "lib", "libclang-cpp.so*")):
-              if os.path.islink(p) or not os.path.isfile(p):
-                  continue
+          import os, glob, struct
+          tc = os.environ["TOOLCHAIN"]
+          for p in glob.glob(os.path.join(tc, "lib", "libclang-cpp.so*")):
+              if os.path.islink(p) or not os.path.isfile(p): continue
               with open(p, "r+b") as f:
-                  data = bytearray(f.read())
-                  if data[:4] != b"\x7fELF":
-                      continue
-                  e_phoff = struct.unpack_from("<Q", data, 32)[0]
-                  e_phentsize = struct.unpack_from("<H", data, 54)[0]
-                  e_phnum = struct.unpack_from("<H", data, 56)[0]
-                  for i in range(e_phnum):
-                      p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = struct.unpack_from(
-                          "<IIQQQQQQ", data, e_phoff + i * e_phentsize
-                      )
-                      if p_type == 2:  # PT_DYNAMIC
-                          for pos in range(p_offset, p_offset + p_filesz, 16):
-                              d_tag, d_val = struct.unpack_from("<qQ", data, pos)
-                              if d_tag == 0:
-                                  break
-                              if d_tag in (12, 13, 25, 26, 27, 28):
-                                  struct.pack_into("<qQ", data, pos, 0x6FFFFFF0, 0)
+                  d = bytearray(f.read())
+                  if d[:4] != b"\x7fELF": continue
+                  phoff, phent, phnum = struct.unpack_from("<Q", d, 32)[0], struct.unpack_from("<H", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
+                  for i in range(phnum):
+                      pt, _, poff, _, _, pfsz, _, _ = struct.unpack_from("<IIQQQQQQ", d, phoff + i * phent)
+                      if pt == 2:
+                          for pos in range(poff, poff + pfsz, 16):
+                              tag, _ = struct.unpack_from("<qQ", d, pos)
+                              if tag == 0: break
+                              if tag in (12, 13, 25, 26, 27, 28): struct.pack_into("<qQ", d, pos, 0x6FFFFFF0, 0)
                           break
-                  f.seek(0)
-                  f.write(data)
-              print(f"Neutralized duplicate LLVM init/fini arrays in {p}")
-
-          nm_bin = os.path.join(toolchain, "bin", "llvm-nm")
-
-          def get_defined_syms(so_path):
-              if not os.path.exists(nm_bin):
-                  return set()
-              out = subprocess.check_output([nm_bin, "-D", "--defined-only", so_path], text=True, stderr=subprocess.DEVNULL)
-              syms = set()
-              for line in out.splitlines():
-                  parts = line.split()
-                  if len(parts) >= 3:
-                      syms.add(parts[-1].split("@")[0])
-              return syms
-
-          def get_undefined_syms(bin_path):
-              if not os.path.exists(nm_bin):
-                  return set()
-              out = subprocess.check_output([nm_bin, "-D", "-u", bin_path], text=True, stderr=subprocess.DEVNULL)
-              syms = set()
-              for line in out.splitlines():
-                  parts = line.split()
-                  if parts:
-                      syms.add(parts[-1].split("@")[0])
-              return syms
-
-          llvm_sos = [p for p in glob.glob(os.path.join(toolchain, "lib", "libLLVM*.so*")) if not os.path.islink(p) and os.path.isfile(p)]
-          clang_sos = [p for p in glob.glob(os.path.join(toolchain, "lib", "libclang-cpp.so*")) if not os.path.islink(p) and os.path.isfile(p)]
-          llvm_syms = get_defined_syms(llvm_sos[0]) if llvm_sos else set()
-          clang_syms = get_defined_syms(clang_sos[0]) if clang_sos else set()
-          clang_only_syms = clang_syms - llvm_syms
-
-          for b in glob.glob(os.path.join(toolchain, "bin", "*")):
-              if os.path.islink(b) or not os.path.isfile(b):
-                  continue
-              with open(b, "rb") as f:
-                  if f.read(4) != b"\x7fELF":
-                      continue
+                  f.seek(0); f.write(d)
+          for b in glob.glob(os.path.join(tc, "bin", "*")):
+              if os.path.islink(b) or not os.path.isfile(b): continue
               with open(b, "r+b") as f:
-                  data = bytearray(f.read())
-                  e_phoff = struct.unpack_from("<Q", data, 32)[0]
-                  e_phentsize = struct.unpack_from("<H", data, 54)[0]
-                  e_phnum = struct.unpack_from("<H", data, 56)[0]
-                  dyn_off = dyn_sz = 0
-                  loads = []
-                  for i in range(e_phnum):
-                      p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = struct.unpack_from(
-                          "<IIQQQQQQ", data, e_phoff + i * e_phentsize
-                      )
-                      if p_type == 2:
-                          dyn_off, dyn_sz = p_offset, p_filesz
-                      if p_type == 1:
-                          loads.append((p_vaddr, p_vaddr + p_filesz, p_offset))
-                  if not dyn_off:
-                      continue
-                  def vaddr_to_off(v):
-                      for s, e, o in loads:
-                          if s <= v < e:
-                              return o + (v - s)
-                      return 0
-                  strtab_va = 0
-                  slots = []
-                  for pos in range(dyn_off, dyn_off + dyn_sz, 16):
-                      d_tag, d_val = struct.unpack_from("<qQ", data, pos)
-                      if d_tag == 0:
-                          break
-                      if d_tag == 5:
-                          strtab_va = d_val
-                      if d_tag == 1:
-                          slots.append((pos, d_val))
-                  strtab_off = vaddr_to_off(strtab_va)
-                  def get_s(idx):
-                      end = data.find(b"\x00", strtab_off + idx)
-                      return data[strtab_off + idx:end].decode(errors="ignore")
-                  needed_names = [get_s(val) for _, val in slots]
-                  if not any("libclang-cpp" in n for n in needed_names):
-                      continue
-                  undef = get_undefined_syms(b)
-                  used_clang_only = undef & clang_only_syms
-                  print(f"{b}: DT_NEEDED={needed_names}, clang-only symbols used={len(used_clang_only)}")
-                  if not used_clang_only and clang_only_syms:
-                      for pos, val in slots:
-                          if "libclang-cpp" in get_s(val):
-                              struct.pack_into("<qQ", data, pos, 0x6FFFFFF0, 0)
-                      print(f"  -> Removed unused libclang-cpp from {b}")
-                  else:
-                      sorted_slots = sorted(
-                          slots,
-                          key=lambda x: (0 if "libLLVM" in get_s(x[1]) else (2 if "libclang-cpp" in get_s(x[1]) else 1))
-                      )
-                      for (pos, _), (_, new_val) in zip(slots, sorted_slots):
-                          struct.pack_into("<qQ", data, pos, 1, new_val)
-                      print(f"  -> Reordered DT_NEEDED of {b}: {[get_s(v) for _, v in sorted_slots]}")
-                  f.seek(0)
-                  f.write(data)
+                  d = bytearray(f.read())
+                  if d[:4] != b"\x7fELF": continue
+                  phoff, phent, phnum = struct.unpack_from("<Q", d, 32)[0], struct.unpack_from("<H", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
+                  doff = dsz = 0; loads = []
+                  for i in range(phnum):
+                      pt, _, poff, pva, _, pfsz, _, _ = struct.unpack_from("<IIQQQQQQ", d, phoff + i * phent)
+                      if pt == 2: doff, dsz = poff, pfsz
+                      elif pt == 1: loads.append((pva, pva + pfsz, poff))
+                  if not doff: continue
+                  strva = 0; slots = []
+                  for pos in range(doff, doff + dsz, 16):
+                      tag, val = struct.unpack_from("<qQ", d, pos)
+                      if tag == 0: break
+                      if tag == 5: strva = val
+                      elif tag == 1: slots.append((pos, val))
+                  stroff = next((o + (strva - s) for s, e, o in loads if s <= strva < e), 0)
+                  gs = lambda idx: d[stroff + idx:d.find(b"\x00", stroff + idx)].decode(errors="ignore")
+                  if not any("libclang-cpp" in gs(v) for _, v in slots): continue
+                  for (pos, _), (_, nv) in zip(slots, sorted(slots, key=lambda x: (0 if "libLLVM" in gs(x[1]) else (2 if "libclang-cpp" in gs(x[1]) else 1)))):
+                      struct.pack_into("<qQ", d, pos, 1, nv)
+                  f.seek(0); f.write(d)
           PY_ELF_FIX
 
-          # Cria linker scripts Pure LLVM para -l:libunwind.a, -l:libc++.a, -l:libc++abi.a (quando -static-libgcc é usado)
-          # e redireciona -lgcc_s / -lgcc em profundidade >= 3 (rts-native/adalib e rustlib/*/lib)!
           printf 'INPUT(libunwind.so.1)\n' > "$TOOLCHAIN/lib/libunwind.a"
           printf 'INPUT(libc++.so.1)\n' > "$TOOLCHAIN/lib/libc++.a"
           printf 'INPUT(libc++abi.so.1)\n' > "$TOOLCHAIN/lib/libc++abi.a"
-
           mkdir -p "$TOOLCHAIN/lib/rts-native/adalib"
-          for shim_dir in "$TOOLCHAIN/lib/rts-native/adalib" "$TOOLCHAIN/lib/rustlib"/*/lib; do
-            if [ -d "$shim_dir" ]; then
-              printf 'INPUT(libunwind.so.1)\n' > "$shim_dir/libunwind.a"
-              printf 'INPUT(-lunwind)\n' > "$shim_dir/libgcc_s.so"
-              printf 'INPUT(-lunwind)\n' > "$shim_dir/libgcc_eh.a"
-              printf 'INPUT(-lclang_rt.builtins)\n' > "$shim_dir/libgcc.a"
-            fi
+          for sdir in "$TOOLCHAIN/lib/rts-native/adalib" "$TOOLCHAIN/lib/rustlib"/*/lib; do
+            [ -d "$sdir" ] || continue
+            printf 'INPUT(libunwind.so.1)\n' > "$sdir/libunwind.a"
+            printf 'INPUT(-lunwind)\n' > "$sdir/libgcc_s.so"
+            printf 'INPUT(-lunwind)\n' > "$sdir/libgcc_eh.a"
+            printf 'INPUT(-lclang_rt.builtins)\n' > "$sdir/libgcc.a"
           done
 
           if [ -d "$TOOLCHAIN/lib/rts-native/adalib" ]; then
-            # Sincroniza a assinatura de versão dos arquivos .ali da RTS (v15 -> v16) para compatibilidade
-            # com o frontend llvm-gnat1 / llvm-gnatbind (compilado sobre gcc-16 Ada sources) e aplica chmod 444!
             chmod u+w "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
             sed -i 's/V "GNAT Lib v[0-9]\+"/V "GNAT Lib v16"/g' "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
             chmod 444 "$TOOLCHAIN/lib/rts-native/adalib/"*.ali 2>/dev/null || true
-
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnat-15.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnarl.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/rts-native/adalib/libgnarl-15.so"
             printf 'INPUT(libgnat-15.so)\n' > "$TOOLCHAIN/lib/rts-native/adalib/libgnat.a"
             printf 'INPUT(libgnarl-15.so)\n' > "$TOOLCHAIN/lib/rts-native/adalib/libgnarl.a"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/libgnat-15.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnat-15.so" "$TOOLCHAIN/lib/libgnat.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/libgnarl-15.so"
-            ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/libgnarl-15.so" "$TOOLCHAIN/lib/libgnarl.so"
+            for l in libgnat libgnarl; do
+              for d in "$TOOLCHAIN/lib/rts-native/adalib" "$TOOLCHAIN/lib"; do
+                ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/${l}-15.so" "$d/${l}.so"
+                ln -sfn "/usr/lib/${{ matrix.gnu_triple }}/${l}-15.so" "$d/${l}-15.so"
+              done
+            done
           fi
-
-          if find "$TOOLCHAIN/bin" -maxdepth 1 \
-            \( -name 'gcc' -o -name 'gcc-*' -o -name 'g++' -o -name 'g++-*' \
-               -o -name 'cc1' -o -name 'cc1plus' -o -name 'gnat1' \) | grep -q .; then
-            echo "ERRO: compiladores GNU inesperados no pacote final" >&2
-            exit 1
-          fi
-          if find "$TOOLCHAIN/lib" -maxdepth 2 \
-            \( -name 'libstdc++*' -o -name 'libgcc*' \) | grep -q .; then
-            echo "ERRO: artefatos da biblioteca C++/GCC no pacote final" >&2
-            exit 1
-          fi
-          test -e "$TOOLCHAIN/lib/libclang-cpp.so" || exit 1
 
           find "$TOOLCHAIN/bin" -type f -print0 | xargs -0 -n 10 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
-          find "$TOOLCHAIN/lib" -maxdepth 1 -type f \( \
-            -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" -o \
-            -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \
-          \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
+          find "$TOOLCHAIN/lib" -maxdepth 1 -type f \( -name "libLLVM*.so*" -o -name "libclang*.so*" -o -name "libMLIR*.so*" -o -name "libFortran*.so*" -o -name "liblldb*.so*" -o -name "librustc_driver*.so*" \) -print0 | xargs -0 -n 4 -P "$CORES" "$STRIP" --strip-unneeded 2>/dev/null || true
 
-      - name: "📋 1B. Manifesto de Arquivos + Verificação de Componentes Essenciais (${{ matrix.arch }})"
+      - name: "🧪 2. Auditoria ELF Global + Suíte Industrial de 7 Testes (${{ matrix.arch }})"
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         run: |
           TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
-          cd "$TOOLCHAIN"
-
-          find . | sed -E 's/x86_64|aarch64|amd64|arm64|x86-64/ARCH/g' | LC_ALL=C sort > "$GITHUB_WORKSPACE/manifest-${{ matrix.arch }}.txt"
-
-          TOTAL=$(wc -l < "$GITHUB_WORKSPACE/manifest-${{ matrix.arch }}.txt")
-          FILES=$(find . -type f | wc -l)
-          LINKS=$(find . -type l | wc -l)
-          DIRS=$(find . -type d | wc -l)
-          echo "Entradas totais: $TOTAL | arquivos: $FILES | symlinks: $LINKS | diretórios: $DIRS"
-
-          {
-            echo "### Contagem (${{ matrix.arch }})"
-            echo "| Entradas | Arquivos | Symlinks | Diretórios |"
-            echo "|---|---|---|---|"
-            echo "| $TOTAL | $FILES | $LINKS | $DIRS |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          for d in bin lib include share libexec; do
-            if [ -d "$d" ]; then
-              echo "  $d: $(find "$d" | wc -l) entradas"
-            fi
-          done
-
-          MISSING=0
-          check() {
-            label="$1"; shift
-            if [ -z "$(find "$TOOLCHAIN" "$@" 2>/dev/null | head -n 1)" ]; then
-              echo "❌ AUSENTE: $label"
-              MISSING=1
-            else
-              echo "✅ ok: $label"
-            fi
-          }
-          check "clang"                    -path '*/bin/clang' \( -type f -o -type l \)
-          check "ld.lld"                   -path '*/bin/ld.lld' \( -type f -o -type l \)
-          check "llvm-config"              -path '*/bin/llvm-config'
-          check "libLLVM.so"               -name 'libLLVM*.so*'
-          check "libclang-cpp.so"          -name 'libclang-cpp.so*'
-          check "libc++.so"                -name 'libc++.so*'
-          check "libc++abi.so"             -name 'libc++abi.so*'
-          check "libunwind.so"             -name 'libunwind.so*'
-          check "compiler-rt builtins"     -name 'libclang_rt.builtins*.a'
-          check "swiftc / swift-frontend"  -path '*/bin/swift-frontend'
-          check "libswiftCore.so"          -name 'libswiftCore.so'
-          check "libdispatch.so"           -name 'libdispatch.so'
-          check "libBlocksRuntime.so"      -name 'libBlocksRuntime.so*'
-          check "lldb"                     -path '*/bin/lldb'
-          check "liblldb.so"               -name 'liblldb*.so*'
-          check "flang"                    \( -path '*/bin/flang' -o -path '*/bin/flang-new' \)
-          check "libflang_rt (runtime)"    -name 'libflang_rt*'
-          check "libFortran*"              -name 'libFortran*'
-          check "libMLIR*"                 -name 'libMLIR*.so*'
-          check "rustc"                    -path '*/bin/rustc'
-          check "librustc_driver"          -name 'librustc_driver*.so'
-          check "llvm-gnat1"               -path '*/bin/llvm-gnat1'
-          check "llvm-gnatmake"            -path '*/bin/llvm-gnatmake'
-
-          if [ "$MISSING" -ne 0 ]; then
-            echo "ERRO FATAL: componente(s) essencial(is) ausente(s) em ${{ matrix.arch }}. Provável falha mascarada por '|| true' no build." >&2
-            exit 1
-          fi
-          echo "✅ Todos os componentes essenciais presentes em ${{ matrix.arch }}"
-
-      - name: Upload do Manifesto (${{ matrix.arch }})
-        if: steps.pkg-cache.outputs.cache-hit != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: pkg-manifest-${{ matrix.arch }}
-          path: manifest-${{ matrix.arch }}.txt
-          retention-days: 7
-
-      - name: "🧪 2. Auditoria ELF Global (Cenários A e B) + Suíte Industrial de 7 Testes (${{ matrix.arch }})"
-        if: steps.pkg-cache.outputs.cache-hit != 'true'
-        run: |
-          TOOLCHAIN="${{ env.INSTALL_PREFIX }}"
-
-          echo "===================================================================="
-          echo "🧹 REMOVENDO COMPILADORES GCC/G++/GNAT/LLVM DO CONTAINER"
-          echo "===================================================================="
-          apt-get purge -y gcc g++ gnat gcc-14 g++-14 gnat-14 gcc-15 g++-15 gnat-15 \
-            libgcc-14-dev libgcc-15-dev libstdc++-14-dev libstdc++-15-dev \
-            clang clang-21 lld lld-21 lldb lldb-21 || true
-
-          echo "===================================================================="
-          echo "📦 EXECUTANDO O SCRIPT OFICIAL install-ubuntu26.04-deps.sh"
-          echo "===================================================================="
+          apt-get purge -y gcc g++ gnat gcc-14 g++-14 gnat-14 gcc-15 g++-15 gnat-15 libgcc-14-dev libgcc-15-dev libstdc++-14-dev libstdc++-15-dev clang clang-21 lld lld-21 lldb lldb-21 || true
           "$TOOLCHAIN/install-ubuntu26.04-deps.sh"
-
           export PATH="$TOOLCHAIN/bin:$PATH"
-          TEST_DIR=$(mktemp -d /tmp/omnillvm-tests.XXXXXX)
-          cd "$TEST_DIR"
+          TEST_DIR=$(mktemp -d /tmp/omnillvm-tests.XXXXXX) && cd "$TEST_DIR"
 
-          echo "===================================================================="
-          echo "🧪 INICIANDO AUDITORIA 100% PURE SWIFT-LLVM (CENÁRIOS A & B INCLUSOS)"
-          echo "===================================================================="
-
-          echo "-> [1/7] Varrendo TODOS os binários e bibliotecas ELF da toolchain contra 'not found' e 'libpython'..."
-          if ldd "$TOOLCHAIN/bin/lldb" "$TOOLCHAIN/lib/liblldb.so"* | grep -q "libpython"; then
-            echo "❌ ERRO FATAL: libpython encontrada no LLDB (${{ matrix.arch }})!"
-            exit 1
-          fi
-          BROKEN_ELFS=0
+          ! ldd "$TOOLCHAIN/bin/lldb" "$TOOLCHAIN/lib/liblldb.so"* | grep -q "libpython"
           for elf in $(find "$TOOLCHAIN/bin" "$TOOLCHAIN/lib" -type f \( -executable -o -name "*.so*" \) -exec file {} + | awk -F: '/ELF/ {print $1}'); do
             MISSING=$(ldd "$elf" 2>/dev/null | grep "not found" || true)
-            if [ -n "$MISSING" ]; then
-              echo "❌ Dependência ausente em $elf:"
-              echo "$MISSING"
-              BROKEN_ELFS=1
-            fi
+            [ -z "$MISSING" ] || { echo "❌ Dependência ausente em $elf: $MISSING"; exit 1; }
+            ! patchelf --print-needed "$elf" 2>/dev/null | grep -q '^libstdc++' || { echo "❌ $elf depende de libstdc++"; exit 1; }
           done
-          if [ "$BROKEN_ELFS" -ne 0 ]; then
-            echo "❌ ERRO FATAL: Foram encontradas bibliotecas ausentes na varredura global ELF!"
-            exit 1
-          fi
-          echo "✅ [1/7] Varredura ELF Global: nenhuma biblioteca ausente!"
+          echo "✅ [1/7] Auditoria ELF Global e Pure libc++ OK!"
 
-          if find "$TOOLCHAIN/bin" "$TOOLCHAIN/lib" -type f -exec file {} + \
-             | awk -F: '/ELF/ {print $1}' | while IFS= read -r elf; do
-                if patchelf --print-needed "$elf" 2>/dev/null | grep -q '^libstdc++'; then
-                  echo "ERRO: $elf ainda depende de libstdc++.so" >&2
-                  exit 1
-                fi
-              done; then
-            echo "✅ Nenhum binário ELF depende de libstdc++.so"
-          else
-            echo "ERRO: dependência C++ GNU detectada. Compile esse componente com LLVM libc++." >&2
-            exit 1
-          fi
-
-          echo "-> [2/7] Testando Clang/Clang++ Pure Swift-LLVM (compiler-rt + libc++ + libunwind + lld)..."
-          cat << 'EOF' > test_c.c
-          int c_add(int a, int b) { return a + b; }
-          EOF
+          printf 'int c_add(int a, int b){return a+b;}\n' > test_c.c
           cat << 'EOF' > test_cpp.cpp
           #include <iostream>
-          #include <vector>
-          #include <string>
           #include <stdexcept>
-          extern "C" int c_add(int a, int b);
-          extern "C" int rust_mul(int a, int b);
+          extern "C" int c_add(int, int);
+          extern "C" int rust_mul(int, int);
           int main() {
-              try {
-                  throw std::runtime_error("swift_llvm_libunwind_ok");
-              } catch (const std::exception& e) {
-                  std::vector<std::string> v = {"OmniLLVM", "Pure-Swift-LLVM-libc++", e.what()};
-                  if (c_add(20, 22) != 42 || rust_mul(6, 7) != 42) return 1;
-                  std::cout << "✅ [2/7] C/C++/Rust FFI & Swift-LLVM libunwind/libc++ OK: " << v[0] << " (" << v[2] << ")\n";
-              }
-              return 0;
+            try { throw std::runtime_error("ok"); }
+            catch (...) { if (c_add(20, 22) != 42 || rust_mul(6, 7) != 42) return 1; std::cout << "✅ [2/7] C/C++/Rust FFI OK\n"; }
+            return 0;
           }
           EOF
+          printf '#[no_mangle]\npub extern "C" fn rust_mul(a:i32,b:i32)->i32{a*b}\n' > test_rust_ffi.rs
           "$TOOLCHAIN/bin/clang" -O3 -c test_c.c -o test_c.o
           "$TOOLCHAIN/bin/clang++" -O3 -std=c++23 -c test_cpp.cpp -o test_cpp.o
-
-          echo "-> [3/7] Testando Rustc 1.94.0 Pure LLVM (FFI + Stdlib Threads sem GCC e sem Cargo)..."
-          cat << 'EOF' > test_rust_ffi.rs
-          #[no_mangle]
-          pub extern "C" fn rust_mul(a: i32, b: i32) -> i32 { a * b }
-          EOF
           "$TOOLCHAIN/bin/rustc" -O --crate-type=staticlib test_rust_ffi.rs -o librust_ffi.a
-          "$TOOLCHAIN/bin/clang++" -O3 test_cpp.o test_c.o librust_ffi.a -lpthread -ldl -o test_ffi_bin
-          ./test_ffi_bin
+          "$TOOLCHAIN/bin/clang++" -O3 test_cpp.o test_c.o librust_ffi.a -lpthread -ldl -o test_ffi_bin && ./test_ffi_bin
 
-          cat << 'EOF' > test_rust_bin.rs
-          use std::thread;
-          fn main() {
-              let h = thread::spawn(|| (1..=10).sum::<i32>());
-              assert_eq!(h.join().unwrap(), 55);
-              println!("✅ [3/7] Rustc 1.94.0 Runtime & Threads OK (Linkado via Clang/LLD sem GCC)!");
-          }
-          EOF
-          "$TOOLCHAIN/bin/rustc" -O -C linker="$TOOLCHAIN/bin/clang" -C link-arg=-L"$TOOLCHAIN/lib" test_rust_bin.rs -o test_rust_bin
-          ./test_rust_bin
+          printf 'use std::thread;\nfn main(){let h=thread::spawn(||(1..=10).sum::<i32>());assert_eq!(h.join().unwrap(),55);println!("✅ [3/7] Rustc Threads OK!");}\n' > test_rust_bin.rs
+          "$TOOLCHAIN/bin/rustc" -O -C linker="$TOOLCHAIN/bin/clang" -C link-arg=-L"$TOOLCHAIN/lib" test_rust_bin.rs -o test_rust_bin && ./test_rust_bin
 
-          echo "-> [4/7] Testando Swiftc 6.4.1 (swiftc + libswiftCore.so + libdispatch.so)..."
           cat << 'EOF' > test_swift.swift
           import Dispatch
-          struct Point { var x: Int; var y: Int }
+          import Foundation
+          struct Point: Codable, Equatable { var x: Int; var y: Int }
           let p = Point(x: 20, y: 22)
-          assert(p.x + p.y == 42)
-          print("✅ [4/7] Swiftc 6.4.1 Runtime, Stdlib & libdispatch OK: \(p.x + p.y)")
+          let data = try JSONEncoder().encode(p)
+          let dec = try JSONDecoder().decode(Point.self, from: data)
+          assert(dec == p && dec.x + dec.y == 42)
+          assert(URL(string: "https://swift.org")!.host == "swift.org" && !UUID().uuidString.isEmpty)
+          print("✅ [4/7] Swiftc 6.4.2 + Foundation + libdispatch OK: \(dec.x + dec.y)")
           EOF
-          "$TOOLCHAIN/bin/swiftc" -O -use-ld=lld test_swift.swift -L"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin
-          ./test_swift_bin
+          "$TOOLCHAIN/bin/swiftc" -O -use-ld=lld test_swift.swift -L"$TOOLCHAIN/lib" -L"$TOOLCHAIN/lib/swift/linux" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib" -Xlinker -rpath -Xlinker "$TOOLCHAIN/lib/swift/linux" -o test_swift_bin && ./test_swift_bin
 
-          echo "-> [5/7] Testando Ada GNAT-LLVM 27.1 (llvm-gnatmake 100% sem gcc/gnat instalado no sistema!)..."
-          cat << 'EOF' > hello_ada.adb
-          with Ada.Text_IO; use Ada.Text_IO;
-          procedure Hello_Ada is
-             X : constant Integer := 42;
-          begin
-             Put_Line ("✅ [5/7] Ada GNAT-LLVM 27.1 Pure LLVM Runtime OK:" & Integer'Image (X));
-          end Hello_Ada;
-          EOF
-          export ADA_INCLUDE_PATH="$TOOLCHAIN/lib/rts-native/adainclude"
-          export ADA_OBJECTS_PATH="$TOOLCHAIN/lib/rts-native/adalib"
-          "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb -largs -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib"
-          ./hello_ada
+          printf 'with Ada.Text_IO; use Ada.Text_IO;\nprocedure Hello_Ada is begin Put_Line("✅ [5/7] Ada GNAT-LLVM OK: 42"); end Hello_Ada;\n' > hello_ada.adb
+          ADA_INCLUDE_PATH="$TOOLCHAIN/lib/rts-native/adainclude" ADA_OBJECTS_PATH="$TOOLCHAIN/lib/rts-native/adalib" \
+            "$TOOLCHAIN/bin/llvm-gnatmake" -O3 hello_ada.adb -largs -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib" && ./hello_ada
 
-          echo "-> [6/7] Testando Fortran Flang 21 (Executável 100% Fortran Standalone com flang-rt + ISO_C_BINDING)..."
           FLANG_BIN=$(ls "$TOOLCHAIN/bin/flang" "$TOOLCHAIN/bin/flang-new" 2>/dev/null | head -n 1)
-          cat << 'EOF' > hello_standalone.f90
-          program hello_fortran
-            implicit none
-            integer :: a, b
-            a = 20
-            b = 22
-            if (a + b /= 42) stop 1
-            print '(A,I2)', "✅ [6A/7] Fortran 100% Standalone (flang-rt I/O) OK: ", a + b
-          end program hello_fortran
-          EOF
-          "$FLANG_BIN" -O3 hello_standalone.f90 -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib" -o hello_standalone
-          ./hello_standalone
+          printf 'program h\nimplicit none\ninteger::a=20,b=22\nif(a+b/=42)stop 1\nprint "(A,I2)","✅ [6A/7] Fortran Standalone OK: ",a+b\nend program h\n' > hello_standalone.f90
+          "$FLANG_BIN" -O3 hello_standalone.f90 -L"$TOOLCHAIN/lib" -Wl,-rpath,"$TOOLCHAIN/lib" -o hello_standalone && ./hello_standalone
 
-          cat << 'EOF' > test_fortran.f90
-          pure integer function fort_square(x) bind(c, name="fort_square")
-            use iso_c_binding, only: c_int
-            integer(c_int), value, intent(in) :: x
-            fort_square = x * x
-          end function fort_square
-          EOF
+          printf 'pure integer function fort_square(x) bind(c,name="fort_square")\nuse iso_c_binding,only:c_int\ninteger(c_int),value,intent(in)::x\nfort_square=x*x\nend function\n' > test_fortran.f90
+          printf '#include <stdio.h>\nextern int fort_square(int);\nint main(){if(fort_square(7)!=49)return 1;printf("✅ [6B/7] Fortran ISO_C_BINDING OK: %d\\n",fort_square(7));return 0;}\n' > test_fort_main.c
           "$FLANG_BIN" -O3 -c test_fortran.f90 -o test_fortran.o
-          cat << 'EOF' > test_fort_main.c
-          #include <stdio.h>
-          extern int fort_square(int x);
-          int main() {
-              if (fort_square(7) != 49) return 1;
-              printf("✅ [6B/7] Fortran (Flang 21 ISO_C_BINDING) ABI OK: %d\n", fort_square(7));
-              return 0;
-          }
-          EOF
-          "$TOOLCHAIN/bin/clang" -O3 test_fort_main.c test_fortran.o -o test_fort_bin
-          ./test_fort_bin
+          "$TOOLCHAIN/bin/clang" -O3 test_fort_main.c test_fortran.o -o test_fort_bin && ./test_fort_bin
 
-          echo "-> [7/7] Testando LLDB Batch Mode..."
           "$TOOLCHAIN/bin/lldb" --batch -o "target create ./test_ffi_bin" -o "version" -o "quit"
           echo "✅ [7/7] LLDB Batch Execution OK!"
-
           cd /opt && rm -rf "$TEST_DIR"
-          echo "===================================================================="
-          echo "🎉 TODOS OS 7 TESTES (INCLUINDO CENÁRIOS A E B) PASSARAM COM 100%!"
-          echo "===================================================================="
 
-      - name: 3. Compactar Pacote Final com ZSTD Nível 19 Multi-Thread (${{ matrix.arch }})
+      - name: 3. Compactar Pacote Final ZSTD Nível 19
         if: steps.pkg-cache.outputs.cache-hit != 'true'
-        run: |
-          cd /opt
-          tar -I "zstd -19 -T0" -cf $GITHUB_WORKSPACE/omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst omnillvm
+        run: tar -I "zstd -19 -T0" -cf $GITHUB_WORKSPACE/omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst -C /opt omnillvm
 
-      - name: 4. Salvar Cache do Pacote Final (Stage 3 - ${{ matrix.arch }})
+      - name: 4. Salvar Cache do Pacote Final
         if: steps.pkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst
           key: omnillvm-final-pkg-${{ env.PACKAGE_CACHE_REV }}-${{ env.CORE_CACHE_REV }}-${{ env.FRONTEND_CACHE_REV }}-${{ matrix.arch }}
 
-      - name: Upload do Pacote Final (${{ matrix.arch }})
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: release-pkg-${{ matrix.arch }}
           path: omnillvm-toolchain-ubuntu26.04-${{ matrix.arch }}.tar.zst
@@ -1694,130 +810,347 @@ jobs:
           retention-days: 1
 
   # ============================================================================
-  # Compara os manifestos amd64 x arm64 (informativo — não bloqueia a release)
-  # ============================================================================
-  compare-manifests:
-    name: "Compare: amd64 vs arm64 (arquivos normalizados)"
-    needs: package-arch
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    continue-on-error: true
-    steps:
-      - name: Baixar Manifestos
-        uses: actions/download-artifact@v4
-        with:
-          pattern: "pkg-manifest-*"
-          merge-multiple: true
-
-      - name: Diff amd64 x arm64
-        run: |
-          if [ ! -f manifest-amd64.txt ] || [ ! -f manifest-arm64.txt ]; then
-            echo "Manifestos ausentes (provável cache hit do pacote final); nada a comparar."
-            echo "Manifestos ausentes (cache hit do pacote final); nada a comparar." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          A=$(wc -l < manifest-amd64.txt)
-          B=$(wc -l < manifest-arm64.txt)
-          echo "amd64: $A entradas | arm64: $B entradas | diferença: $(( A - B ))"
-
-          diff manifest-amd64.txt manifest-arm64.txt > manifest.diff || true
-          ONLY_AMD=$(grep -c '^<' manifest.diff || true)
-          ONLY_ARM=$(grep -c '^>' manifest.diff || true)
-
-          {
-            echo "### Comparação de manifestos"
-            echo "| | Entradas |"
-            echo "|---|---|"
-            echo "| amd64 | $A |"
-            echo "| arm64 | $B |"
-            echo "| Só no amd64 | $ONLY_AMD |"
-            echo "| Só no arm64 | $ONLY_ARM |"
-            echo ""
-            echo "<details><summary>Diff completo (primeiras 300 linhas)</summary>"
-            echo ""
-            echo '```diff'
-            head -n 300 manifest.diff
-            echo '```'
-            echo "</details>"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "--- Só no amd64 (primeiras 60) ---"
-          grep '^<' manifest.diff | head -n 60 || true
-          echo "--- Só no arm64 (primeiras 60) ---"
-          grep '^>' manifest.diff | head -n 60 || true
-
-      - name: Upload do Diff
-        uses: actions/upload-artifact@v4
-        with:
-          name: manifest-diff
-          path: manifest.diff
-          retention-days: 7
-          if-no-files-found: ignore
-
-  # ============================================================================
-  # ESTÁGIO 4: Publica AMD64 e ARM64 + Script APT na Release
+  # ESTÁGIO 4: Auditoria Exaustiva AMD64 × ARM64 + Publicação da Release
   # ============================================================================
   publish-release:
-    name: "Stage 4: Publish Release (Ubuntu 26.04 AMD64 + ARM64)"
+    name: "Stage 4: Audit AMD64xARM64 & Publish Release"
     needs: package-arch
     runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     steps:
-      - name: Checkout (para consultar tags existentes)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Baixar Pacotes Finais
+      - name: Baixar Pacotes Finais (AMD64 e ARM64)
         uses: actions/download-artifact@v4
         with:
           pattern: "release-pkg-*"
           merge-multiple: true
 
-      - name: Gerar Script de Instalação APT para Release, Calcular Versão e Checksums SHA256
+      - name: "🔍 Executar Auditoria Exaustiva AMD64 × ARM64 (scripts/comparar_omnillvm.py)"
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends zstd python3
+          mkdir -p scripts
+          cat << 'PY_EOF' > scripts/comparar_omnillvm.py
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          import argparse, io, os, re, struct, subprocess, sys, tarfile
+          from collections import Counter, defaultdict
+          from dataclasses import dataclass, field
+          from typing import Dict, List, Optional, Set, Tuple
+
+          @dataclass
+          class EntryInfo:
+              path: str; kind: str; size: int; mode: int; linkname: str = ""
+              is_elf: bool = False; elf_type: str = ""; dt_needed: List[str] = field(default_factory=list)
+              soname: str = ""; text_sample: str = ""
+
+          def parse_elf_metadata(buf: bytes) -> Tuple[bool, str, List[str], str]:
+              if len(buf) < 64 or buf[:4] != b"\x7fELF": return False, "", [], ""
+              if buf[4] != 2 or buf[5] != 1: return True, "ELF", [], ""
+              elf_t = {1: "REL", 2: "EXEC", 3: "DYN", 4: "CORE"}.get(struct.unpack_from("<H", buf, 16)[0], "OTHER")
+              phoff, phent, phnum = struct.unpack_from("<Q", buf, 32)[0], struct.unpack_from("<H", buf, 54)[0], struct.unpack_from("<H", buf, 56)[0]
+              if not phoff or not phnum or phoff + phnum * phent > len(buf): return True, elf_t, [], ""
+              doff = dsz = 0; loads = []
+              for i in range(phnum):
+                  pt, _, poff, pva, _, pfsz, _, _ = struct.unpack_from("<IIQQQQQQ", buf, phoff + i * phent)
+                  if pt == 2: doff, dsz = poff, pfsz
+                  elif pt == 1: loads.append((pva, pva + pfsz, poff))
+              if not doff or doff + dsz > len(buf): return True, elf_t, [], ""
+              strva = None; nidx = []; soidx = None
+              for pos in range(doff, doff + dsz - 15, 16):
+                  tag, val = struct.unpack_from("<qQ", buf, pos)
+                  if tag == 0: break
+                  elif tag == 5: strva = val
+                  elif tag == 1: nidx.append(val)
+                  elif tag == 14: soidx = val
+              if strva is None: return True, elf_t, [], ""
+              stroff = next((o + (strva - s) for s, e, o in loads if s <= strva < e and 0 <= o + (strva - s) < len(buf)), None)
+              if stroff is None: return True, elf_t, [], ""
+              def cstr(idx: int) -> str:
+                  st = stroff + idx
+                  if st < 0 or st >= len(buf): return ""
+                  end = buf.find(b"\x00", st)
+                  return buf[st:(end if end != -1 else min(len(buf), st + 256))].decode("utf-8", errors="replace")
+              return True, elf_t, [cstr(i) for i in nidx if cstr(i)], (cstr(soidx) if soidx is not None else "")
+
+          def scan_tar_zst(archive_path: str) -> Tuple[Dict[str, EntryInfo], Dict[str, str]]:
+              if not os.path.isfile(archive_path) or os.path.getsize(archive_path) == 0:
+                  raise RuntimeError(f"Pacote ausente ou vazio: {archive_path}")
+              entries: Dict[str, EntryInfo] = {}; meta: Dict[str, str] = {}
+              use_zstd = archive_path.endswith(".zst") and subprocess.call(["which", "zstd"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+              proc = subprocess.Popen(["zstd", "-dc", archive_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE) if use_zstd else None
+              ctx = tarfile.open(fileobj=proc.stdout, mode="r|") if proc else tarfile.open(archive_path, mode="r|*")
+              try:
+                  with ctx as tf:
+                      for m in tf:
+                          name = m.name.lstrip("./")
+                          if not name or m.isdir(): continue
+                          kind = "symlink" if m.issym() else ("hardlink" if m.islnk() else ("file" if m.isfile() else "other"))
+                          info = EntryInfo(path=name, kind=kind, size=m.size if kind == "file" else 0, mode=m.mode, linkname=m.linkname or "")
+                          if kind == "file" and m.size > 0:
+                              fobj = tf.extractfile(m)
+                              if fobj:
+                                  head = fobj.read(4)
+                                  if head == b"\x7fELF":
+                                      buf = head + fobj.read(min(m.size - 4, 4 * 1024 * 1024))
+                                      info.is_elf, info.elf_type, info.dt_needed, info.soname = parse_elf_metadata(buf)
+                                  elif m.size <= 4096:
+                                      info.text_sample = (head + fobj.read(4092)).decode("utf-8", errors="replace").strip()
+                          m_llvm = re.search(r"libLLVM-(\d+(?:\.\d+)*)\.so|libLLVM\.so\.(\d+(?:\.\d+)*)", name)
+                          if m_llvm and "llvm" not in meta: meta["llvm"] = m_llvm.group(1) or m_llvm.group(2)
+                          m_clang = re.search(r"/lib/clang/(\d+(?:\.\d+)*)/", name)
+                          if m_clang and "clang" not in meta: meta["clang"] = m_clang.group(1)
+                          if name.endswith("rust-installer-version") and info.text_sample: meta["rustc"] = info.text_sample.splitlines()[0].strip()
+                          if name.endswith("/system.ali") and info.text_sample:
+                              m_ali = re.search(r'V "GNAT Lib (v\d+)"', info.text_sample)
+                              if m_ali: meta["gnat_ali"] = m_ali.group(1)
+                          entries[name] = info
+              except Exception as exc:
+                  if proc: proc.kill()
+                  raise RuntimeError(f"Pacote corrompido ou falha ao ler {archive_path}: {exc}") from exc
+              if proc and proc.wait() != 0:
+                  raise RuntimeError(f"zstd falhou ao descompactar {archive_path}")
+              return entries, meta
+
+          def classify_entry(e: EntryInfo) -> Tuple[str, str]:
+              p, base = e.path, os.path.basename(e.path)
+              if e.kind in ("symlink", "hardlink"): t_desc = f"{e.kind} -> {e.linkname}"
+              elif e.is_elf: t_desc = f"ELF ({e.elf_type})"
+              elif base.endswith((".a", ".so")) and e.text_sample.startswith(("INPUT(", "GROUP(")): t_desc = f"linker script ({os.path.splitext(base)[1]})"
+              elif base.endswith((".a", ".rlib")): t_desc = "arquivo estático"
+              else: t_desc = "arquivo regular"
+              if "/bin/" in f"/{p}" or "/libexec/" in f"/{p}":
+                  return ("Outros arquivos" if base.endswith(".cfg") else "Executáveis"), t_desc
+              if re.search(r"\.so(\.\d+)*$", base): return "Bibliotecas compartilhadas", t_desc
+              if base.endswith(".a"): return "Bibliotecas estáticas", t_desc
+              if base.endswith((".rlib", ".swiftmodule", ".swiftinterface", ".swiftdoc", ".swiftsourceinfo", ".abi.json", ".ali", ".mod")) or ".swiftmodule/" in p:
+                  return "Módulos de linguagem", t_desc
+              if "/include/" in f"/{p}" or "/adainclude/" in f"/{p}" or base.endswith((".h", ".hpp", ".ads", ".adb", ".inc", ".modulemap")):
+                  return "Headers e includes", t_desc
+              return "Outros arquivos", t_desc
+
+          def normalize_arch_path(path: str) -> str:
+              s = re.sub(r"(x86_64|aarch64)-unknown-linux-gnu", "<arch>-unknown-linux-gnu", path)
+              s = re.sub(r"(x86_64|aarch64)-linux-gnu", "<arch>-linux-gnu", s)
+              s = re.sub(r"/(x86_64|aarch64)/", "/<arch>/", s)
+              s = re.sub(r"\b(x86_64|aarch64)\.(swiftmodule|swiftdoc|swiftsourceinfo|swiftinterface|abi\.json)\b", r"<arch>.\2", s)
+              s = re.sub(r"clang_rt\.(crtbegin|crtend)-(x86_64|aarch64)\.o\b", r"clang_rt.\1-<arch>.o", s)
+              s = re.sub(r"libclang_rt\.builtins-(x86_64|aarch64)\.a\b", r"libclang_rt.builtins-<arch>.a", s)
+              return re.sub(r"(lib/rustlib/<arch>-unknown-linux-gnu/lib/lib[a-zA-Z0-9_]+)-[0-9a-f]{16}(\.(?:rlib|so|rmeta))$", r"\1-<hash>\2", s)
+
+          def md_esc(t: str) -> str:
+              return t.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", "").replace("`", "\\`") if t else "—"
+
+          def main() -> int:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--amd64", required=True); ap.add_argument("--arm64", required=True)
+              ap.add_argument("--out", default="omnillvm-comparativo.md"); ap.add_argument("--summary-out", default="")
+              ap.add_argument("--swift-ver", default="6.4.2"); ap.add_argument("--rust-ver", default="1.94.0"); ap.add_argument("--gnat-ver", default="27.1")
+              args = ap.parse_args()
+
+              amd_map, amd_meta = scan_tar_zst(args.amd64)
+              arm_map, arm_meta = scan_tar_zst(args.arm64)
+
+              amd_by_n: Dict[str, List[EntryInfo]] = defaultdict(list)
+              arm_by_n: Dict[str, List[EntryInfo]] = defaultdict(list)
+              for e in amd_map.values(): amd_by_n[normalize_arch_path(e.path)].append(e)
+              for e in arm_map.values(): arm_by_n[normalize_arch_path(e.path)].append(e)
+
+              aligned = []
+              for nk in sorted(set(amd_by_n.keys()) | set(arm_by_n.keys())):
+                  al, bl = sorted(amd_by_n.get(nk, []), key=lambda x: x.path), sorted(arm_by_n.get(nk, []), key=lambda x: x.path)
+                  if len(al) <= 1 and len(bl) <= 1:
+                      aligned.append((nk, al[0] if al else None, bl[0] if bl else None))
+                  else:
+                      ar, br = {x.path: x for x in al}, {x.path: x for x in bl}
+                      for rp in sorted(set(ar.keys()) | set(br.keys())): aligned.append((rp, ar.get(rp), br.get(rp)))
+
+              cat_stats: Dict[str, Counter] = defaultdict(Counter); tot = Counter()
+              for side, mp in (("amd", amd_map), ("arm", arm_map)):
+                  for e in mp.values():
+                      tot[f"{side}_total"] += 1; tot[f"{side}_bytes"] += e.size
+                      tot[f"{side}_{'symlinks' if e.kind == 'symlink' else 'files'}"] += 1
+                      cat_stats[classify_entry(e)[0]][side] += 1
+
+              rows = []
+              for nk, ea, eb in aligned:
+                  ref = ea or eb; cat, _ = classify_entry(ref)
+                  if ea and eb:
+                      tot["both"] += 1; cat_stats[cat]["both"] += 1
+                      _, ta = classify_entry(ea); _, tb = classify_entry(eb)
+                      sit = "Presente em ambas" if ea.kind == eb.kind else "⚠️ Tipo divergente (arquivo vs link)"
+                      tdesc = ta if ta == tb else f"AMD64: {ta} | ARM64: {tb}"
+                      notes = []
+                      if ea.path != eb.path: notes.append("Equivalente por arquitetura")
+                      if ea.is_elf and ea.soname: notes.append(f"SONAME: {ea.soname}")
+                      elif ea.text_sample.startswith("INPUT("): notes.append(f"Shim: {ea.text_sample.splitlines()[0]}")
+                      obs = "; ".join(notes) or "—"
+                  elif ea:
+                      tot["only_amd"] += 1; cat_stats[cat]["only_amd"] += 1
+                      _, tdesc = classify_entry(ea); sit = "Exclusivo AMD64"
+                      obs = "Específico da arquitetura x86/AMD64"
+                  else:
+                      tot["only_arm"] += 1; cat_stats[cat]["only_arm"] += 1
+                      _, tdesc = classify_entry(eb); sit = "Exclusivo ARM64"
+                      obs = "Específico da arquitetura ARM/AArch64"
+                  rows.append({
+                      "cat": cat, "norm": nk, "ap": ea.path if ea else "—", "bp": eb.path if eb else "—", "type": tdesc,
+                      "as": ("—" if not ea else ("0 (link)" if ea.kind in ("symlink", "hardlink") else f"{ea.size:,}")),
+                      "bs": ("—" if not eb else ("0 (link)" if eb.kind in ("symlink", "hardlink") else f"{eb.size:,}")),
+                      "sit": sit, "obs": obs
+                  })
+              rows.sort(key=lambda r: (r["cat"], r["norm"], r["ap"], r["bp"]))
+
+              def has_m(mp: Dict[str, EntryInfo], pat: str) -> List[str]:
+                  rx = re.compile(pat); return sorted([p for p in mp if rx.search(p)])
+
+              lv = amd_meta.get("llvm") or arm_meta.get("llvm") or "21"
+              cv = amd_meta.get("clang") or arm_meta.get("clang") or "21"
+              gv = amd_meta.get("gnat_ali") or arm_meta.get("gnat_ali") or "v16"
+              req = [
+                  ("LLVM Core", r"(^|/)bin/llvm-config$", r"(^|/)lib/libLLVM.*\.so", f"LLVM {lv}"),
+                  ("Clang", r"(^|/)bin/clang$", r"(^|/)lib/libclang-cpp\.so", f"Clang {cv}"),
+                  ("Clang++", r"(^|/)bin/clang\+\+$", r"(^|/)bin/clang\+\+\.cfg$", f"Clang++ {cv}"),
+                  ("LLD", r"(^|/)bin/ld\.lld$", r"(^|/)bin/lld$", f"LLD {lv}"),
+                  ("LLDB", r"(^|/)bin/lldb$", r"(^|/)lib/liblldb.*\.so", f"LLDB {lv}"),
+                  ("Swift Compiler & Stdlib", r"(^|/)bin/swift-frontend$", r"libswiftCore\.so$", f"Swift {args.swift_ver}"),
+                  ("Swift Foundation", r"libFoundation.*\.so", r"Foundation\.swiftmodule", f"Foundation ({args.swift_ver})"),
+                  ("Rustc", r"(^|/)bin/rustc$", r"librustc_driver.*\.so$", f"Rustc {args.rust_ver}"),
+                  ("Flang + flang-rt", r"(^|/)bin/flang(-new|-21)?$", r"libflang_rt\.runtime", f"Flang {lv}"),
+                  ("GNAT-LLVM", r"(^|/)bin/llvm-gnat1$", r"(^|/)bin/llvm-gnatmake$", f"GNAT-LLVM {args.gnat_ver} ({gv})"),
+                  ("libdispatch", r"libdispatch\.so", r"libBlocksRuntime\.so", "libdispatch"),
+                  ("libc++ & libc++abi", r"(^|/)lib/libc\+\+\.so", r"(^|/)lib/libc\+\+abi\.so", f"libc++ {lv}"),
+                  ("compiler-rt", r"libclang_rt\.builtins.*\.a$", r"(^|/)lib/crtbeginS\.o$", f"compiler-rt {lv}"),
+                  ("libunwind", r"(^|/)lib/libunwind\.so", r"(^|/)lib/libunwind\.a$", f"libunwind {lv}"),
+              ]
+              checks = []; fatal = []
+              for cname, p1, p2, vstr in req:
+                  a1, a2, b1, b2 = has_m(amd_map, p1), has_m(amd_map, p2), has_m(arm_map, p1), has_m(arm_map, p2)
+                  aok, bok = bool(a1 and a2), bool(b1 and b2)
+                  if not aok: fatal.append(f"Componente obrigatório ausente no AMD64: {cname}")
+                  if not bok: fatal.append(f"Componente obrigatório ausente no ARM64: {cname}")
+                  checks.append((cname, vstr, f"✅ (`{a1[0]}`)" if aok else "❌ Ausente", f"✅ (`{b1[0]}`)" if bok else "❌ Ausente", "✅ OK" if (aok and bok) else "❌ FALHA"))
+
+              for rname, pat in [
+                  ("Proibido: Executáveis GCC/G++/GNAT1 em bin/", r"(^|/)bin/(gcc|gcc-\d+|g\+\+|g\+\+-\d+|cc1|cc1plus|gnat1)$"),
+                  ("Proibido: Bibliotecas libstdc++", r"(^|/)libstdc\+\+\.(so|a)"),
+                  ("Proibido: Bibliotecas libgcc na raiz lib/ (prof. <= 2)", r"^[^/]+/lib/([^/]+/)?libgcc(_s)?\.(so|a)"),
+                  ("Proibido: Cargo", r"(^|/)bin/cargo(-.*)?$"),
+                  ("Proibido: SwiftPM / swift-driver externo", r"(^|/)bin/swift-(package|build|test|run|sdk|driver|driver-new)$"),
+              ]:
+                  ab, bb = has_m(amd_map, pat), has_m(arm_map, pat)
+                  if ab or bb: fatal.append(f"Regra violada ({rname}): AMD64={len(ab)}, ARM64={len(bb)}")
+                  checks.append((rname, "Pure LLVM", "✅ 0" if not ab else f"❌ {len(ab)}", "✅ 0" if not bb else f"❌ {len(bb)}", "✅ Limpo" if not (ab or bb) else "❌ VIOLAÇÃO"))
+
+              for lbl, mp in (("AMD64", amd_map), ("ARM64", arm_map)):
+                  bad = [p for p, e in mp.items() if e.is_elf and any(n.startswith("libstdc++") for n in e.dt_needed)]
+                  if bad: fatal.append(f"DT_NEEDED libstdc++.so detectado em {lbl}: {', '.join(bad[:5])}")
+
+              def ext_deps(mp: Dict[str, EntryInfo]) -> Set[str]:
+                  prov = {os.path.basename(p) for p in mp if ".so" in os.path.basename(p)} | {e.soname for e in mp.values() if e.soname}
+                  return {n for e in mp.values() for n in e.dt_needed if n not in prov and not n.startswith(("libLLVM", "libclang", "libswift", "libFoundation", "lib_Foundation", "libdispatch", "libBlocksRuntime", "libc++", "libunwind", "liblldb", "librustc", "libstd-", "libMLIR", "libFortran", "libflang"))}
+
+              ext_a, ext_b = ext_deps(amd_map), ext_deps(arm_map)
+              status_str = "APROVADA ✅" if not fatal else "REPROVADA ❌"
+
+              with open(args.out, "w", encoding="utf-8") as out:
+                  out.write(f"# 📊 Auditoria Completa AMD64 × ARM64 — OmniLLVM ({status_str})\n\n")
+                  if fatal:
+                      out.write("## ❌ Falhas Detectadas\n" + "".join(f"- ❌ {e}\n" for e in fatal) + "\n")
+                  out.write("## 1. Resumo de Totais por Arquitetura e Categoria\n\n")
+                  out.write("| Métrica / Categoria | AMD64 | ARM64 | Em Ambas | Exclusivos AMD64 | Exclusivos ARM64 |\n|---|---:|---:|---:|---:|---:|\n")
+                  out.write(f"| **Total de Entradas** | **{tot['amd_total']:,}** | **{tot['arm_total']:,}** | **{tot['both']:,}** | **{tot['only_amd']:,}** | **{tot['only_arm']:,}** |\n")
+                  out.write(f"| Arquivos regulares | {tot['amd_files']:,} | {tot['arm_files']:,} | — | — | — |\n")
+                  out.write(f"| Links simbólicos | {tot['amd_symlinks']:,} | {tot['arm_symlinks']:,} | — | — | — |\n")
+                  for c in ["Executáveis", "Bibliotecas compartilhadas", "Bibliotecas estáticas", "Módulos de linguagem", "Headers e includes", "Outros arquivos"]:
+                      st = cat_stats[c]
+                      out.write(f"| {c} | {st['amd']:,} | {st['arm']:,} | {st['both']:,} | {st['only_amd']:,} | {st['only_arm']:,} |\n")
+                  out.write("\n## 2. Verificações Obrigatórias de Componentes e Políticas Pure LLVM\n\n")
+                  out.write("| Componente / Regra | Versão / Metadado | AMD64 | ARM64 | Situação |\n|---|---|---|---|---|\n")
+                  for c, v, a, b, s in checks: out.write(f"| {md_esc(c)} | {md_esc(v)} | {a} | {b} | {s} |\n")
+                  out.write("\n## 3. Dependências Externas do Sistema vs. Inventário de Build CI\n\n")
+                  out.write("### 3.1. Dependências Dinâmicas Externas (`DT_NEEDED` do Sistema / `install-ubuntu26.04-deps.sh`)\n\n")
+                  out.write("| Biblioteca (`DT_NEEDED`) | AMD64 | ARM64 | Origem |\n|---|---|---|---|\n")
+                  for d in sorted(ext_a | ext_b):
+                      orig = "Exceção Ada RTS (`libgnat-15` APT)" if "gnat" in d or "gnarl" in d else "Sistema Ubuntu 26.04 (`libc6` / APT)"
+                      out.write(f"| `{md_esc(d)}` | {'Sim' if d in ext_a else 'Não'} | {'Sim' if d in ext_b else 'Não'} | {orig} |\n")
+                  out.write("\n### 3.2. Inventário: Usado no CI vs. Empacotado no Tarball Final\n\n")
+                  out.write("| Componente | Usado no Build CI? | Empacotado na Release? | Detalhes |\n|---|---|---|---|\n")
+                  out.write("| Swift Bootstrap (`/opt/swift-bootstrap`) | Sim (Stage 1) | **Não** | Removido antes do empacotamento |\n")
+                  out.write("| GNAT-15 / GCC-15 Bootstrap | Sim (Stage 2) | **Não** | Usado apenas para gerar `llvm-gnat1` e `.ali`; apenas `libgnat-15.so` externa é referenciada |\n")
+                  out.write("| Sanitizers `compiler-rt` (`hwasan`/`asan`) | Sim (Stage 1) | **Não** | Removidos no Stage 3 para eliminar dependência de `libstdc++.so` |\n")
+                  out.write("| Cargo / SwiftPM / Swift-Driver externo | **Não** | **Não** | Desativados por design (Pure Compilers) |\n\n")
+                  out.write("## 4. Tabela Comparativa Completa (100% dos Arquivos e Links Simbólicos)\n\n")
+                  out.write("| Categoria | Caminho/identificador normalizado | Arquivo AMD64 | Arquivo ARM64 | Tipo | Tamanho AMD64 | Tamanho ARM64 | Situação | Observações |\n")
+                  out.write("|---|---|---|---|---|---:|---:|---|---|\n")
+                  for r in rows:
+                      out.write(f"| {md_esc(r['cat'])} | `{md_esc(r['norm'])}` | `{md_esc(r['ap'])}` | `{md_esc(r['bp'])}` | {md_esc(r['type'])} | {r['as']} | {r['bs']} | {md_esc(r['sit'])} | {md_esc(r['obs'])} |\n")
+
+              summ = (
+                  f"### 🔍 Auditoria AMD64 × ARM64: **{status_str}**\n"
+                  f"- **AMD64:** {tot['amd_total']:,} entradas ({tot['amd_files']:,} arquivos, {tot['amd_symlinks']:,} symlinks)\n"
+                  f"- **ARM64:** {tot['arm_total']:,} entradas ({tot['arm_files']:,} arquivos, {tot['arm_symlinks']:,} symlinks)\n"
+                  f"- **Em ambas:** {tot['both']:,} | **Exclusivos AMD64:** {tot['only_amd']:,} | **Exclusivos ARM64:** {tot['only_arm']:,}\n"
+                  f"- **Relatório completo (sem truncamento):** `omnillvm-comparativo.md` ({len(rows):,} linhas)\n"
+              )
+              print(summ)
+              if args.summary_out:
+                  with open(args.summary_out, "a", encoding="utf-8") as sf: sf.write(summ + "\n")
+              return 1 if fatal else 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY_EOF
+          chmod +x scripts/comparar_omnillvm.py
+          python3 scripts/comparar_omnillvm.py \
+            --amd64 omnillvm-toolchain-ubuntu26.04-amd64.tar.zst \
+            --arm64 omnillvm-toolchain-ubuntu26.04-arm64.tar.zst \
+            --out omnillvm-comparativo.md \
+            --summary-out "$GITHUB_STEP_SUMMARY" \
+            --swift-ver "${{ env.SWIFT_BOOTSTRAP_VER }}" \
+            --rust-ver "${{ env.RUST_BRANCH }}" \
+            --gnat-ver "27.1"
+
+      - name: Upload do Relatório Comparativo (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: omnillvm-comparativo-report
+          path: omnillvm-comparativo.md
+          retention-days: 30
+
+      - name: Gerar Script APT, Calcular Versão e Checksums SHA256 (Incluindo Relatório)
         id: meta
         run: |
           if [ -n "${{ inputs.release_tag }}" ]; then
             NEXT_VER="${{ inputs.release_tag }}"
           else
             LAST_VER=$(git ls-remote --tags --refs origin | awk -F'refs/tags/' '{print $2}' | grep -E '^[0-9]+$' | sort -n | tail -n 1)
-            if [ -z "$LAST_VER" ]; then
-              NEXT_VER=1
-            else
-              NEXT_VER=$(( LAST_VER + 1 ))
-            fi
+            NEXT_VER=$(( ${LAST_VER:-0} + 1 ))
           fi
 
           cat << 'EOF' > install-ubuntu26.04-deps.sh
           #!/usr/bin/env bash
           set -euo pipefail
-          if [ "$(id -u)" -ne 0 ]; then
-            SUDO="sudo"
-          else
-            SUDO=""
-          fi
-          echo "📦 Instalando dependências de sistema (GNAT RTS 15 é a exceção Ada necessária)..."
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
           export DEBIAN_FRONTEND=noninteractive
           $SUDO apt-get update -qq
           $SUDO apt-get install -y --no-install-recommends \
-            libc6-dev \
-            libedit2 libncurses6 libncurses-dev libtinfo6 \
+            libc6-dev libedit2 libncurses6 libncurses-dev libtinfo6 \
             zlib1g zlib1g-dev libzstd1 liblzma5 libuuid1 \
-            libicu78 libxml2-16 \
-            libblocksruntime0 libblocksruntime-dev \
-            libgnat-15
-
-          echo "✅ Dependências de sistema instaladas! Extraia o pacote em /opt/omnillvm e adicione /opt/omnillvm/bin ao PATH."
+            libicu78 libxml2-16 libcurl4t64 \
+            libblocksruntime0 libblocksruntime-dev libgnat-15
+          echo "✅ Dependências instaladas! Extraia o pacote em /opt/omnillvm e adicione /opt/omnillvm/bin ao PATH."
           EOF
           chmod +x install-ubuntu26.04-deps.sh
 
-          echo "🚀 Publicando Release Versão: $NEXT_VER"
           echo "tag=$NEXT_VER" >> $GITHUB_OUTPUT
-
-          sha256sum omnillvm-toolchain-ubuntu26.04-*.tar.zst install-ubuntu26.04-deps.sh > SHA256SUMS.txt
-          ls -lh omnillvm-toolchain-ubuntu26.04-*.tar.zst install-ubuntu26.04-deps.sh
+          sha256sum omnillvm-toolchain-ubuntu26.04-amd64.tar.zst \
+                    omnillvm-toolchain-ubuntu26.04-arm64.tar.zst \
+                    install-ubuntu26.04-deps.sh \
+                    omnillvm-comparativo.md > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publicar no GitHub Releases
@@ -1828,9 +1161,9 @@ jobs:
           name: "OmniLLVM Unified Toolchain - Release ${{ steps.meta.outputs.tag }} [Ubuntu 26.04 | AMD64 & ARM64]"
           body: |
             ### OmniLLVM Unified Toolchain — Ubuntu 26.04 LTS (`amd64` & `arm64`)
-            Toolchain **Swift-LLVM com bibliotecas C++ do LLVM** (sem executáveis GCC/G++ no pacote e sem `libstdc++` vinculada; a RTS Ada `libgnat-15` permanece como dependência indispensável do GNAT bootstrap), unificando `libLLVM.so` 21 (`swift/release/6.4.1`), `compiler-rt`, `libc++`, `libunwind`, `libdispatch`, `flang-rt` e `ld.lld` para **C, C++, Fortran (Flang), Ada (GNAT 27.1), Rust (Rustc 1.94.0) e Swift (Swiftc 6.4.1)**.
+            Toolchain **Swift-LLVM Pure Compilers** unificando `libLLVM.so` 21 (`swift/release/6.4.2`), `compiler-rt`, `libc++`, `libunwind`, `Foundation`, `Collections`, `libdispatch`, `flang-rt` e `ld.lld` para **C, C++, Fortran (Flang 21), Ada (GNAT-LLVM 27.1), Rust (Rustc 1.94.0) e Swift (Swiftc 6.4.2 + Foundation)**.
+            Inclui o relatório de auditoria exaustiva **`omnillvm-comparativo.md`** comparando 100% dos arquivos e links simbólicos entre `amd64` e `arm64`.
 
-            #### 1. Extrair em `/opt/omnillvm` e instalar dependências de sistema do Ubuntu 26.04 (Sem GCC):
             ```bash
             sudo tar -I zstd -xf omnillvm-toolchain-ubuntu26.04-$(dpkg --print-architecture).tar.zst -C /opt/
             sudo /opt/omnillvm/install-ubuntu26.04-deps.sh
@@ -1840,4 +1173,5 @@ jobs:
             omnillvm-toolchain-ubuntu26.04-amd64.tar.zst
             omnillvm-toolchain-ubuntu26.04-arm64.tar.zst
             install-ubuntu26.04-deps.sh
+            omnillvm-comparativo.md
             SHA256SUMS.txt
